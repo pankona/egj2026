@@ -1,4 +1,4 @@
-.PHONY: lint test build build-wasm serve-wasm run clean fmt install-tools
+.PHONY: lint test build build-wasm serve-wasm devserver run clean fmt install-tools
 
 lint:
 	GOOS=js GOARCH=wasm go vet ./...
@@ -19,6 +19,9 @@ build-wasm:
 	cp web/* dist/
 
 serve-wasm: build-wasm
+	go run ./devserver
+
+devserver:
 	go run ./devserver
 
 install-tools:
