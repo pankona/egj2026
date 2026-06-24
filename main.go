@@ -731,11 +731,34 @@ func (g *Game) claimEnclosure() {
 		return
 	}
 
+	// An enemy whose center sits directly on a wall cell (typically the just-
+	// burned slash beam) is neither "inside" nor part of any component, so a
+	// strict inside[cx][cy] test lets enemies riding the closing edge slip
+	// through. Fall back to 4-neighbor probing in that case: if any adjacent
+	// cell belongs to the claimed component, treat the enemy as sealed.
+	sealed := func(cx, cy int) bool {
+		if cx < 0 || cx >= GridWidth || cy < 0 || cy >= GridHeight {
+			return false
+		}
+		if inside[cx][cy] {
+			return true
+		}
+		for _, d := range [4][2]int{{1, 0}, {-1, 0}, {0, 1}, {0, -1}} {
+			nx, ny := cx+d[0], cy+d[1]
+			if nx < 0 || nx >= GridWidth || ny < 0 || ny >= GridHeight {
+				continue
+			}
+			if inside[nx][ny] {
+				return true
+			}
+		}
+		return false
+	}
 	survivors := g.enemies[:0]
 	for _, e := range g.enemies {
 		cx := int(e.X) / CellSize
 		cy := int(e.Y) / CellSize
-		if cx >= 0 && cx < GridWidth && cy >= 0 && cy < GridHeight && inside[cx][cy] {
+		if sealed(cx, cy) {
 			continue
 		}
 		survivors = append(survivors, e)
