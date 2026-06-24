@@ -21,9 +21,11 @@ const (
 	GridWidth  = ScreenWidth / CellSize  // 80
 	GridHeight = ScreenHeight / CellSize // 60
 
-	MaxCharge     = 900.0
-	ChargeRecover = 3.6
-	BladeRadius   = 2 // cells
+	MaxStock       = 3   // simultaneous slashes per reload cycle
+	ReloadFrames   = 180 // frames to refill from 0 to MaxStock
+	SlashMinLength = 32  // px; shorter drags are ignored (no stock cost)
+	SlashMaxLength = 320 // px; longer drags are clipped to this
+	BladeRadius    = 2   // cells (half-thickness of the slash beam)
 
 	LightThresholdCount = 0.35 // cells with light above this counted as bright
 	WallLightThreshold  = 0.5  // cells brighter than this block flood fill
@@ -99,21 +101,24 @@ type Game struct {
 
 	enemies []*Enemy
 
-	currentStage      int
-	dragging          bool
-	prevMX, prevMY    int
-	charge            float64
-	hue               float64
-	stageTime         float64
-	lightPercent      float64
-	rng               *rand.Rand
-	postClearCooldown int
+	currentStage       int
+	dragging           bool
+	slashStartX        int
+	slashStartY        int
+	pointerX, pointerY int // tracked every frame for slash preview drawing
+	stock              int
+	reloadProgress     float64 // 0..1 toward the next stock refill
+	hue                float64
+	stageTime          float64
+	lightPercent       float64
+	rng                *rand.Rand
+	postClearCooldown  int
 }
 
 func newGame() *Game {
 	g := &Game{
 		state:  StateTitle,
-		charge: MaxCharge,
+		stock:  MaxStock,
 		rng:    rand.New(rand.NewSource(20260622)),
 		pixels: make([]byte, GridWidth*GridHeight*4),
 	}
@@ -140,7 +145,8 @@ func (g *Game) loadStage(idx int) {
 			g.grid[x][y] = Cell{}
 		}
 	}
-	g.charge = MaxCharge
+	g.stock = MaxStock
+	g.reloadProgress = 0
 	g.stageTime = s.TimeLimit
 	g.dragging = false
 	g.lightPercent = 0
@@ -234,25 +240,30 @@ func (g *Game) Update() error {
 
 func (g *Game) updatePlaying() {
 	mx, my, pressed := pointerPos()
+	g.pointerX, g.pointerY = mx, my
 
-	wasDragging := g.dragging
-	if pressed && g.charge > 0 {
-		if !g.dragging {
+	if pressed {
+		if !g.dragging && g.stock > 0 {
 			g.dragging = true
-			g.prevMX, g.prevMY = mx, my
+			g.slashStartX, g.slashStartY = mx, my
 			g.hue += 47 + g.rng.Float64()*30
 		}
-		g.cutLine(g.prevMX, g.prevMY, mx, my)
-		g.prevMX, g.prevMY = mx, my
-	} else {
+	} else if g.dragging {
+		g.fireSlash(g.slashStartX, g.slashStartY, mx, my)
 		g.dragging = false
 	}
-	if wasDragging && !g.dragging {
-		g.claimEnclosure()
-	}
 
-	if !pressed {
-		g.charge = math.Min(MaxCharge, g.charge+ChargeRecover)
+	// Stock refills continuously toward MaxStock. ReloadFrames is the total
+	// time to go from empty to full, so per-frame progress scales with the
+	// number of stocks.
+	if g.stock < MaxStock {
+		g.reloadProgress += float64(MaxStock) / float64(ReloadFrames)
+		for g.reloadProgress >= 1.0 && g.stock < MaxStock {
+			g.stock++
+			g.reloadProgress -= 1.0
+		}
+	} else {
+		g.reloadProgress = 0
 	}
 
 	for _, e := range g.enemies {
@@ -310,16 +321,32 @@ func (g *Game) updatePlaying() {
 	}
 }
 
-func (g *Game) cutLine(x0, y0, x1, y1 int) {
+// fireSlash burns a straight beam from (x0,y0) toward (x1,y1) and consumes
+// one stock. The beam is clipped to SlashMaxLength so a single strike never
+// covers the whole screen; drags below SlashMinLength are ignored (a misclick
+// shouldn't eat a precious stock). After painting, claimEnclosure runs once
+// so any pocket sealed by the new beam (plus the existing light and the
+// screen edge) is captured immediately.
+func (g *Game) fireSlash(x0, y0, x1, y1 int) {
+	if g.stock <= 0 {
+		return
+	}
 	dx := float64(x1 - x0)
 	dy := float64(y1 - y0)
-	dist := math.Sqrt(dx*dx + dy*dy)
-
-	cost := dist
-	if cost > g.charge {
-		cost = g.charge
+	dist := math.Hypot(dx, dy)
+	if dist < SlashMinLength {
+		return
 	}
-	g.charge -= cost
+	if dist > SlashMaxLength {
+		scale := SlashMaxLength / dist
+		x1 = x0 + int(dx*scale)
+		y1 = y0 + int(dy*scale)
+		dx = float64(x1 - x0)
+		dy = float64(y1 - y0)
+		dist = SlashMaxLength
+	}
+
+	g.stock--
 
 	steps := int(dist) + 1
 	for i := 0; i <= steps; i++ {
@@ -328,6 +355,8 @@ func (g *Game) cutLine(x0, y0, x1, y1 int) {
 		py := int(float64(y0) + t*dy)
 		g.illuminate(px, py)
 	}
+
+	g.claimEnclosure()
 }
 
 func (g *Game) illuminate(px, py int) {
@@ -631,10 +660,56 @@ func (g *Game) Draw(screen *ebiten.Image) {
 			color.RGBA{0, 0, 0, alpha}, true)
 	}
 
-	chargeW := float32(220.0)
-	ratio := float32(g.charge / MaxCharge)
-	vector.DrawFilledRect(screen, 10, 10, chargeW, 8, color.RGBA{40, 40, 50, 220}, false)
-	vector.DrawFilledRect(screen, 10, 10, chargeW*ratio, 8, color.RGBA{200, 230, 255, 240}, false)
+	// Slash preview: a thin straight beam from the drag origin to the current
+	// pointer. Clipped at SlashMaxLength so the player sees exactly where the
+	// strike will land; tinted warning-red while shorter than SlashMinLength
+	// to telegraph that the drag will be ignored.
+	if g.state == StatePlaying && g.dragging {
+		x0f := float32(g.slashStartX)
+		y0f := float32(g.slashStartY)
+		dxp := float32(g.pointerX - g.slashStartX)
+		dyp := float32(g.pointerY - g.slashStartY)
+		dist := float32(math.Hypot(float64(dxp), float64(dyp)))
+		x1f := float32(g.pointerX)
+		y1f := float32(g.pointerY)
+		if dist > SlashMaxLength {
+			s := float32(SlashMaxLength) / dist
+			x1f = x0f + dxp*s
+			y1f = y0f + dyp*s
+			dist = SlashMaxLength
+		}
+		col := color.RGBA{255, 255, 255, 110}
+		if dist < SlashMinLength {
+			col = color.RGBA{220, 120, 80, 110}
+		}
+		vector.StrokeLine(screen, x0f, y0f, x1f, y1f, 2, col, true)
+		vector.DrawFilledCircle(screen, x0f, y0f, 3.5, color.RGBA{255, 255, 255, 200}, true)
+	}
+
+	// Stock pips + reload progress bar. Filled pip = ready to slash;
+	// hollow pip = waiting on reload.
+	pipY := float32(14)
+	pipR := float32(5)
+	pipGap := float32(16)
+	for i := 0; i < MaxStock; i++ {
+		cx := 14 + float32(i)*pipGap
+		if i < g.stock {
+			vector.DrawFilledCircle(screen, cx, pipY, pipR,
+				color.RGBA{200, 230, 255, 240}, true)
+		} else {
+			vector.StrokeCircle(screen, cx, pipY, pipR, 1.5,
+				color.RGBA{120, 140, 160, 220}, true)
+		}
+	}
+	if g.stock < MaxStock {
+		barX := 14 + float32(MaxStock)*pipGap + 4
+		barY := pipY - 3
+		barW := float32(60)
+		vector.DrawFilledRect(screen, barX, barY, barW, 6,
+			color.RGBA{40, 40, 50, 220}, false)
+		vector.DrawFilledRect(screen, barX, barY, barW*float32(g.reloadProgress), 6,
+			color.RGBA{200, 230, 255, 200}, false)
+	}
 
 	s := stages[g.currentStage]
 	msg := fmt.Sprintf("Stage %d/%d   Light %3.0f%% / %2.0f%%   Time %4.1fs",
@@ -649,8 +724,8 @@ func (g *Game) Draw(screen *ebiten.Image) {
 	switch g.state {
 	case StateTitle:
 		drawCenter(screen, "R I F T", ScreenHeight/2-40)
-		drawCenter(screen, "Drag to cut the dark. Encircle to claim.", ScreenHeight/2-10)
-		drawCenter(screen, "Reach the light threshold before time runs out.", ScreenHeight/2+4)
+		drawCenter(screen, "Drag a straight slash. 3 strikes per reload.", ScreenHeight/2-10)
+		drawCenter(screen, "Carve the dark and encircle it before time runs out.", ScreenHeight/2+4)
 		drawCenter(screen, "[Click or Space to start]", ScreenHeight/2+34)
 	case StateCleared:
 		next := g.currentStage + 2 // 1-indexed display of the next stage
