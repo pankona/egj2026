@@ -42,7 +42,7 @@ Makefile                 build / build-wasm / serve-wasm / devserver / fmt / rel
 | タイムアップ  | クリック / Space で同ステージリトライ                                         |
 | 全クリア      | クリック / Space でタイトルへ                                                 |
 
-斬撃は `MaxStock` 発分のストック制。1 ドラッグ = 1 発消費、`stock` で残弾を持ち、HUD には残弾ピップ + リロードゲージを描画。撃ち切ると `ReloadFrames` フレームかけて全弾回復する (`reloadProgress` で進捗管理)。短すぎるドラッグ (`SlashMinLength` 未満) は方向不安定とみなしストックを消費しない。
+斬撃は `MaxStock` 発分のストック制。1 ドラッグ = 1 発消費、`stock` で残弾を持ち、HUD には残弾ピップ + (リロード中だけ表示される) リロードゲージを描画。リロードは「使い切り一括補充」: ストックが残っている間はゲージが進まず、`stock == 0` になった瞬間に `reloadProgress` が回り始め、`ReloadFrames` フレーム後に `MaxStock` 発が一気に補充される。短すぎるドラッグ (`SlashMinLength` 未満) は方向不安定とみなしストックを消費しない。
 
 ## ビルド・実行
 
