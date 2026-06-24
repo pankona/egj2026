@@ -5,14 +5,15 @@ Ebitengine Game Jam 2026 への参加作品。テーマは **DISCONNECT（切断
 
 ## ゲーム概要
 
-ドラッグで「方向と位置」を入力すると、指を離した瞬間にドラッグの中点を中心に**固定長の光の衝撃波**が左右両側へズバッと伸びる。3 連発した直線でポリゴン状に囲んだ暗領域は一気に光で塗りつぶされる（claim）。敵は光の縁を侵食して取り戻しに来る。各ステージの光カバー率しきい値を制限時間内に達成すると次へ。最終 10 ステージは巨大ボス 1 体を光で封じ込めるとクリア。
+ドラッグで「方向と位置」を入力すると、指を離した瞬間にドラッグの中点を中心に**固定長の光の衝撃波**が左右両側へズバッと伸びる。3 連発した直線でポリゴン状に囲んだ暗領域は一気に光で塗りつぶされる（claim）。敵は光の縁を侵食しながら、複数体が連携して囲い返してくる。**ステージの敵を全滅させると次へ**。最終 10 ステージは巨大ボス 1 体を光で封じ込めるとクリア。
 
 - 解像度: 640x480、セル 8px の 80x60 グリッド (`CellSize`, `GridWidth`, `GridHeight`)
 - 入力: マウスドラッグ／タッチドラッグ（タッチ優先、`pointerPos` 参照）。フリックでも発動するよう、確定に必要なドラッグ距離は `SlashMinLength` だけ
 - 斬撃 (`fireSlash` → `updateSlashes` → `burnSegment` → `illuminate`): ドラッグの中点を中心に、方向ベクトル両側へ `SlashLength` の固定長で伸びる。`SlashRevealFrames` で全長まで展開し、`SlashGlowFrames` で残光が消える。刃の半径は `BladeRadius` セル。アクティブな斬撃は `Game.slashes []*Slash` で管理し、毎フレーム tip が進んだ分だけ grid に焼く
-- 領域確定 (`claimEnclosure`): 斬撃が全長まで伸びた瞬間にプレイフィールド (常時壁の外周 1 セル内側) を 4-連結の暗領域に分解。**最大の連結成分を「外側」とみなし、それ以外の小さな領域を全部 claim** する。画面端は常時の壁 (Draw 側で 1 セル幅のフレームとして可視化) なので、斬撃が画面端と組み合わせて切り取った小領域も自然に claim 対象になる。内部の敵は除去
-- 侵食 (`erodeAround`): 敵のまわりの光セルを暗くする。光の縁 (`WallLightThreshold` 未満の隣接セルを持つセル) は `EnemyEdgeBoost` 倍で削れる
-- AI (`steerEnemy` / `findNearestLightEdge`): 敵は近傍の光の縁セルを `EnemyRetargetSec` 間隔でロックして寄ってくる
+- 領域確定 (`claimEnclosure`): 斬撃が全長まで伸びた瞬間にプレイフィールド (常時壁の外周 1 セル内側) を 4-連結の暗領域に分解。**画面端に接する成分は「外側」扱いで除外し、完全に閉じた領域だけを claim** する。縦 2 本などの「画面を分割するだけ」のストロークは何も取れず、3 本以上で多角形を組まないと光化されない。内部の敵は claim と同時に除去
+- 侵食 (`erodeAround`): 敵のまわりの光セルを暗くする。光の縁 (`WallLightThreshold` 未満の隣接セルを持つセル) は `EnemyEdgeBoost` 倍で削れる。`EffectRadius = 0` の敵（チュートリアル用）は呼ばれても無効
+- 結界 (`advanceBindPhase` → `bindEdgesNow` → `bindEnclosure`): `EnableBind` ステージでは全敵共通タイマー `bindPhase` が Roaming → Warning → Holding を周回。Holding 終了フレームで、静止中の敵ペアを暗線として描いた壁集合と既存の暗領域を合算し、明領域を連結成分に分解 → 画面端に接しない閉領域を暗化する。プレイヤー側 claim の鏡写し
+- AI (`steerEnemy` / `findNearestLightEdge`): 敵は近傍の光の縁セルを `EnemyRetargetSec` 間隔でロックして寄ってくる。Anchoring 中（`bindPhase != 0`）は移動・侵食・retarget を全部スキップして頂点として固まる
 
 ## 全体構成
 
@@ -26,11 +27,13 @@ web/game.html            wasm 実体を読み込む内側ページ
 Makefile                 build / build-wasm / serve-wasm / devserver / fmt / release
 ```
 
-`Stage` テーブル (`stages`) で `Enemies / EnemySpeed / WinThreshold / TimeLimit / Boss` を 1 行ずつ並べて難易度を作る。新規ステージ追加・調整はここを編集する。
+`Stage` テーブル (`stages`) で `Enemies / EnemySpeed / TimeLimit / Boss / EnableBind / HarmlessEnemy` を 1 行ずつ並べて難易度を作る。新規ステージ追加・調整はここを編集する。`EnableBind` を立てると結界フェーズが解禁され、`HarmlessEnemy` を立てると `EffectRadius=0` の侵食しない敵が生える（ステージ 1 のチュートリアル用）。
 
-`GameState` (`StateTitle / StatePlaying / StateCleared / StateGameOver / StateAllCleared`) の遷移は `Update` のスイッチで一元管理。クリア／ゲームオーバー時の `postClearCooldown` は次入力を受ける前のクッション。
+`GameState` (`StateTitle / StatePlaying / StateCleared / StateGameOver / StateAllCleared`) の遷移は `Update` のスイッチで一元管理。クリア／ゲームオーバー時の `postClearCooldown` は次入力を受ける前のクッション。勝利条件は全ステージ共通で **`len(g.enemies) == 0`** の一本道。
 
 `Game.grid [GridWidth][GridHeight]Cell` が描画の真実の入れ物。`Cell.Light` が 0..1、`R/G/B` がそのセルに塗られた hue 由来の色。`Draw` 側で `Light * (R/G/B)` を 8bit に量子化して `gridImg` に書き、`CellSize` 倍に拡大して描画。
+
+敵の描画は球面ランバート反射モデル（`Draw` 内の敵ループ）。各敵について全画面のグリッドを線形 falloff で集計し、加重平均から「偏り度 (`asymmetry`)」を計算、`ambient + directional * max(0, n·L)` の合成で `stepPx` 刻みの小矩形格子として塗る。`totalLight == 0` の完全暗闇では描画スキップ。詳細は下の設計メモ参照。
 
 ## 操作
 
@@ -79,11 +82,39 @@ make fmt            goimports -w .
 - **少操作 = 大影響**: `SlashMinLength` を 12px まで下げ、フリックでも発動する。「ちょっと指を動かしただけで画面に大きな切れ込みが入る」衝撃波感が目的
 - **即時展開 + 衝撃波の輪**: `SlashRevealFrames = 1` で全長を 1 フレームで描き、中点から白い輪を `Frame ≤ 4` の数フレームだけ広げて消す。`SlashGlowFrames` の残光と組み合わせて「ドンッ」のリズム
 - **3 発ストック + リロード**: 3 本の直線で最小ポリゴン (三角形) が組める。撃ち切りリロードのリズムが「溜めて放つ」緊張感になる。`charge`/`MaxCharge`/`ChargeRecover` の旧チャージシステムは廃止
-- **claim は連結成分 + 最大領域以外を取る**: 当初は「画面端から flood-fill して外側を確定 → 残りを claim」の単純実装だったが、画面端を「常時壁」にした時点で、起点をどこに置いても「リング状の起点エリア = 内側全域に届いて全部 outside」になってしまい claim できなくなった。現行は起点を持たず、暗領域を全部連結成分に分解 → 最大成分を「外側」、残りを全部 claim、と判定する。完全に閉じた多角形でも、画面端と組み合わせた小領域でも、同じロジックで扱える
-- **画面端は常時の壁**: 最外周 1 セルを「あらかじめ引いてある線」として扱い、Draw 側で 1 セル幅のフレームを描画。`claimEnclosure` の連結成分判定はこの 1 セル分を壁としてスキップするので、画面端と斬撃で囲った領域も小領域として claim される
+- **claim は完全閉領域だけ**: 当初は「画面端から flood-fill して外側を確定 → 残りを claim」だったが、画面端を「常時壁」にしたら起点エリア = 内側全域につながって claim できなくなった。次に「暗領域を連結成分に分解 → 最大成分を外側 → 残りを claim」に変えたが、これだと縦 2 本引いただけで両端の細長い 2 領域が claim されて 50% 以上塗れてしまうチート気味のムーブが成立した。現行は **「画面端の内周 1 セルに接する成分は『外側』扱いで除外、画面端と縁を共有しない完全閉領域だけ claim する」**。直線 3 本で三角形を組む儀式が claim 成立の最小単位になっている
+- **画面端は常時の壁**: 最外周 1 セルを「あらかじめ引いてある線」として扱い、Draw 側で 1 セル幅のフレームを描画。`claimEnclosure` の連結成分判定は内周 1 セルに接した時点で「外側」と判定する。画面端と斬撃を組み合わせて細長い領域を切り出しても、それは画面端に接しているので claim 対象外
 - **ドラッグ予告は二層**: ドラッグ中は (a) 始点〜現在ポインタの短い実線 (指先に追従する手触り) と (b) 中点を中心とした薄いフル長ゴースト (確定後の刃の予告) を重ねて描画する
 
 将来「画面が物理的に裂ける」「闇のかけらが破片化して落ちる」などの別アイデアは別軸として保留中。まずはこの衝撃波体験の調整 (`SlashLength` の長さ、`ReloadFrames` のテンポ、ステージごとのストック数) を優先する。
+
+## 設計メモ: なぜ敵に「結界」を持たせたか
+
+初期実装の敵は `erodeAround` で光の縁をジワジワ削るだけで、プレイヤーへの直接の脅威がなく、無視して claim を回しても勝てる消化試合になりがちだった。テーマ DISCONNECT の「光と闇のせめぎ合い」を儀式の対称として見せるため、敵側にもプレイヤー claim と鏡写しになる「結界」儀式を持たせている。
+
+- **3 段サイクル**: `bindPhase` が Roaming (`0`) → Warning (`1`、脈動オーラの予告) → Holding (`2`、暗線が中点から両端へ伸びるアニメ) を周回。タイマーは全敵共通で、`BindRoamFrames` / `BindWarnFrames` / `BindHoldFrames` で各フェーズの長さを定義
+- **頂点と暗線**: Anchoring 中（phase 1/2）は敵が一斉に静止して頂点になる。`bindEdgesNow` が距離 `BindRangeCells` 以内のペアを動的に列挙、`severedPairs` に登録されていない組だけが暗線として描画・暗化に寄与する
+- **介入手段**: 静止中の敵に斬撃が当たれば撃破（`fireSlash` 内で `pointSegmentDistance` 判定、撃破した頂点を含むペアは自動で無効化）。完成中の暗線と斬撃の線分が `segmentsIntersect` で交差すれば、その組が `severedPairs` に登録されて bindEnclosure の壁ラスタライズから除外される
+- **bindEnclosure**: claim の鏡写し。暗線をラスタライズした dark cells に既存の暗領域を足して壁集合とし、「明領域」を 4-連結成分に分解、`claimEnclosure` と同じく画面端に接しない閉領域だけを `Light=0` に落とす
+- **Boss と敵 1 体ステージはスキップ**: 結界は最小 2 頂点が要るので、`advanceBindPhase` は `s.Boss || len(g.enemies) < 2` で phase 進行を止める。`severedPairs` も同時にクリア
+
+## 設計メモ: なぜ勝利条件を「敵全滅」に揃えたか
+
+初期は「光カバー率しきい値 (`WinThreshold`) を制限時間内に達成」が勝利条件だったが、ボスステージだけ別ロジック (`len(g.enemies) == 0`) が走っていて分岐が二重に走っていた。プレイヤー視点でも「カバー率を満たして勝ちが確定したのに、敵がまだ画面に残っている」状態が起きて、消化試合のような違和感が出ていた。
+
+判定を一本化して「敵全滅でクリア」に統一。`Stage.WinThreshold` フィールドも削除。ステージ 1 は敵 0 では成立しないので、`HarmlessEnemy: true` の極低速（`EnemySpeed=0.20`）・`EffectRadius=0`（侵食しない）の 1 体に置き換え、「斬撃を引いて閉領域で claim する」基本ループを 30 秒で学ばせるチュートリアルに。光カバー率は HUD の進捗メータ（`Light xx%`）として残してあるが、勝敗には関わらない。
+
+敵を倒す手段は (a) `claimEnclosure` で完全閉領域を作って中の敵を除去、(b) 結界の Anchoring 中に斬撃で頂点を撃破、の 2 ルート。Roaming 中の敵は斬撃で倒せないため、結界フェーズが「攻めのチャンス」になるリズムを意図的に作っている。
+
+## 設計メモ: なぜ敵を球面ランバートで描くか
+
+斬撃を引いてないステージ序盤は画面のほとんどが暗闇で、敵の位置が当てずっぽうになる課題があった。プレイヤーフィードバックでは「斬撃 = 光源」「敵の輪郭が光に当たって浮かび上がる」のメタファーがハマっていたので、敵の描画を「斬撃で塗られた光を集めて球体に当てるランバート反射」モデルに書き直した。Kage シェーダーは使っていない — 全部 CPU 計算で `vector.DrawFilledRect` を格子状に並べる方式。
+
+- **ライト集計**: 敵ごとに `lightMaxDist`（= 100 セル、画面対角を覆う）範囲内のグリッドを全走査。線形 falloff (`1 - d/maxDist`) で `totalLight` / 加重方向ベクトル (`dirX`, `dirY`) / 加重色 (`litR/G/B`) / 加重距離 (`totalDistance`) / 最大単一寄与 (`maxContribution`) を集計
+- **brightness の根拠**: `sqrt(total/N)` や正規化ではなく `maxContribution` を使う。これで「画面のどこかに光があれば必ず brightness > 0」が保証され、敵から離れた初撃でも敵が薄く浮かぶ
+- **ambient と directional の分離**: 加重平均距離 `avgD = totalDistance / totalLight` で `asymmetry = dirLen / (totalLight * avgD)` を 0..1 で計算。**単一光源 → asymmetry ≈ 1**（片側だけ照らされる Lambertian）、**四方光源 → asymmetry ≈ 0**（全周一様の ambient）。`ambient = brightness * (1-asymmetry) * 0.85`、`directional = brightness * asymmetry`、`intensity = ambient + directional * max(0, n·L)`
+- **球面サンプリング**: 敵を `stepPx` 刻みの矩形格子で塗る（通常敵 1.5px、ボス 3.0px）。各点に法線 `n = (sx/r, sy/r, sqrt(r² - sx² - sy²)/r)` を与え、光源ベクトルは画面平面 + `lz = 0.5` の 3D ベクトルに正規化。`lz` を浮かせるとハイライトが球面の内側に乗り、輪郭ではなく中心寄りが最も明るくなる
+- **完全暗闇は描かない**: `totalLight <= 0` なら敵描画スキップ。ステージ 1 で「最初の斬撃を引いて初めて敵が見える」探索体験を成立させる土台
 
 ## ジャム制約
 
