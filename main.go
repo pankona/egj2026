@@ -22,7 +22,7 @@ const (
 	GridHeight = ScreenHeight / CellSize // 60
 
 	MaxStock          = 3   // slashes available per reload cycle
-	ReloadFrames      = 180 // frames from running dry to a full MaxStock refill
+	ReloadFrames      = 120 // frames from running dry to a full MaxStock refill (2s @ 60fps)
 	SlashMinLength    = 12  // px drag threshold; a flick is enough to fire
 	SlashLength       = 320 // px; every slash is this length, regardless of drag distance
 	SlashRevealFrames = 1   // frames for the beam to extend end-to-end (1 = instant snap)
@@ -595,58 +595,74 @@ func (g *Game) erodeAround(x, y, radius float64) {
 	}
 }
 
-// claimEnclosure detects any dark region fully enclosed by lit cells and the
-// screen border, then fills it with light in the current hue. Enemies caught
-// inside are sealed (removed). Run once on drag release.
+// claimEnclosure splits the playfield (everything inside the always-wall
+// 1-cell border ring) into 4-connected dark components and claims every
+// component except the largest one. The largest component is treated as
+// "the outside"; smaller pockets are halos the player closed off with
+// slashes — either fully enclosed mid-screen, or against the border. This
+// also handles the "slash + border" case naturally: as soon as a slash
+// chops a sliver off the playfield, that sliver becomes a separate, smaller
+// component and gets claimed.
+//
+// Enemies whose centers fall inside a claimed component are sealed
+// (removed). Run once per slash, after the beam reaches full length.
 func (g *Game) claimEnclosure() {
 	const wall = WallLightThreshold
 
-	var outside [GridWidth][GridHeight]bool
+	var compID [GridWidth][GridHeight]int // 0 = wall or border
+	var compSizes []int                   // index = id-1
+	nextID := 1
 	queue := make([][2]int, 0, 512)
 
-	enqueueIfDark := func(x, y int) {
-		if outside[x][y] {
-			return
+	for sx := 1; sx < GridWidth-1; sx++ {
+		for sy := 1; sy < GridHeight-1; sy++ {
+			if compID[sx][sy] != 0 || g.grid[sx][sy].Light >= wall {
+				continue
+			}
+			compID[sx][sy] = nextID
+			queue = append(queue[:0], [2]int{sx, sy})
+			size := 0
+			for len(queue) > 0 {
+				p := queue[0]
+				queue = queue[1:]
+				size++
+				for _, d := range [4][2]int{{1, 0}, {-1, 0}, {0, 1}, {0, -1}} {
+					nx, ny := p[0]+d[0], p[1]+d[1]
+					if nx < 1 || nx >= GridWidth-1 || ny < 1 || ny >= GridHeight-1 {
+						continue
+					}
+					if compID[nx][ny] != 0 || g.grid[nx][ny].Light >= wall {
+						continue
+					}
+					compID[nx][ny] = nextID
+					queue = append(queue, [2]int{nx, ny})
+				}
+			}
+			compSizes = append(compSizes, size)
+			nextID++
 		}
-		if g.grid[x][y].Light >= wall {
-			return
-		}
-		outside[x][y] = true
-		queue = append(queue, [2]int{x, y})
 	}
-	for x := 0; x < GridWidth; x++ {
-		enqueueIfDark(x, 0)
-		enqueueIfDark(x, GridHeight-1)
+
+	if len(compSizes) <= 1 {
+		return // playfield isn't split — nothing to claim
 	}
-	for y := 0; y < GridHeight; y++ {
-		enqueueIfDark(0, y)
-		enqueueIfDark(GridWidth-1, y)
-	}
-	for len(queue) > 0 {
-		p := queue[0]
-		queue = queue[1:]
-		for _, d := range [4][2]int{{1, 0}, {-1, 0}, {0, 1}, {0, -1}} {
-			nx, ny := p[0]+d[0], p[1]+d[1]
-			if nx < 0 || nx >= GridWidth || ny < 0 || ny >= GridHeight {
-				continue
-			}
-			if outside[nx][ny] {
-				continue
-			}
-			if g.grid[nx][ny].Light >= wall {
-				continue
-			}
-			outside[nx][ny] = true
-			queue = append(queue, [2]int{nx, ny})
+
+	// Find the biggest component; treat it as the "outside."
+	largestID, largestSize := 1, compSizes[0]
+	for i, s := range compSizes {
+		if s > largestSize {
+			largestID = i + 1
+			largestSize = s
 		}
 	}
 
 	r, gC, b := hueToRGB(g.hue)
 	var inside [GridWidth][GridHeight]bool
 	claimed := 0
-	for x := 0; x < GridWidth; x++ {
-		for y := 0; y < GridHeight; y++ {
-			if outside[x][y] || g.grid[x][y].Light >= wall {
+	for x := 1; x < GridWidth-1; x++ {
+		for y := 1; y < GridHeight-1; y++ {
+			id := compID[x][y]
+			if id == 0 || id == largestID {
 				continue
 			}
 			inside[x][y] = true
@@ -715,6 +731,15 @@ func (g *Game) Draw(screen *ebiten.Image) {
 	op := &ebiten.DrawImageOptions{}
 	op.GeoM.Scale(CellSize, CellSize)
 	screen.DrawImage(g.gridImg, op)
+
+	// Always-lit border frame: visualizes the 1-cell ring that
+	// claimEnclosure treats as permanent wall. Drawn 1 cell thick so the
+	// visible frame matches the claim geometry exactly.
+	frame := color.RGBA{180, 200, 235, 210}
+	vector.DrawFilledRect(screen, 0, 0, ScreenWidth, CellSize, frame, false)
+	vector.DrawFilledRect(screen, 0, ScreenHeight-CellSize, ScreenWidth, CellSize, frame, false)
+	vector.DrawFilledRect(screen, 0, 0, CellSize, ScreenHeight, frame, false)
+	vector.DrawFilledRect(screen, ScreenWidth-CellSize, 0, CellSize, ScreenHeight, frame, false)
 
 	for _, e := range g.enemies {
 		cx := int(e.X) / CellSize
