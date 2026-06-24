@@ -21,9 +21,13 @@ const (
 	GridWidth  = ScreenWidth / CellSize  // 80
 	GridHeight = ScreenHeight / CellSize // 60
 
-	MaxCharge     = 900.0
-	ChargeRecover = 3.6
-	BladeRadius   = 2 // cells
+	MaxStock          = 3   // simultaneous slashes per reload cycle
+	ReloadFrames      = 180 // frames to refill from 0 to MaxStock
+	SlashMinLength    = 12  // px drag threshold; a flick is enough to fire
+	SlashLength       = 320 // px; every slash is this length, regardless of drag distance
+	SlashRevealFrames = 1   // frames for the beam to extend end-to-end (1 = instant snap)
+	SlashGlowFrames   = 14  // afterglow frames before the slash effect is removed
+	BladeRadius       = 2   // cells (half-thickness of the slash beam)
 
 	LightThresholdCount = 0.35 // cells with light above this counted as bright
 	WallLightThreshold  = 0.5  // cells brighter than this block flood fill
@@ -67,6 +71,18 @@ type Cell struct {
 	R, G, B float32
 }
 
+// Slash is one in-flight strike. It owns its own hue (captured at fire time so
+// reload-induced hue changes don't recolor mid-extension), advances its tip by
+// one Reveal slice per frame, runs claimEnclosure once on full extension, then
+// lingers for SlashGlowFrames as visual residue.
+type Slash struct {
+	X0, Y0  float64
+	X1, Y1  float64
+	Hue     float64
+	Frame   int
+	claimed bool
+}
+
 type Enemy struct {
 	X, Y         float64
 	VX, VY       float64
@@ -98,22 +114,26 @@ type Game struct {
 	pixels  []byte
 
 	enemies []*Enemy
+	slashes []*Slash
 
-	currentStage      int
-	dragging          bool
-	prevMX, prevMY    int
-	charge            float64
-	hue               float64
-	stageTime         float64
-	lightPercent      float64
-	rng               *rand.Rand
-	postClearCooldown int
+	currentStage       int
+	dragging           bool
+	slashStartX        int
+	slashStartY        int
+	pointerX, pointerY int // tracked every frame for slash preview drawing
+	stock              int
+	reloadProgress     float64 // 0..1 toward the next stock refill
+	hue                float64
+	stageTime          float64
+	lightPercent       float64
+	rng                *rand.Rand
+	postClearCooldown  int
 }
 
 func newGame() *Game {
 	g := &Game{
 		state:  StateTitle,
-		charge: MaxCharge,
+		stock:  MaxStock,
 		rng:    rand.New(rand.NewSource(20260622)),
 		pixels: make([]byte, GridWidth*GridHeight*4),
 	}
@@ -140,13 +160,15 @@ func (g *Game) loadStage(idx int) {
 			g.grid[x][y] = Cell{}
 		}
 	}
-	g.charge = MaxCharge
+	g.stock = MaxStock
+	g.reloadProgress = 0
 	g.stageTime = s.TimeLimit
 	g.dragging = false
 	g.lightPercent = 0
 	g.hue = g.rng.Float64() * 360
 
 	g.enemies = g.enemies[:0]
+	g.slashes = g.slashes[:0]
 	if s.Boss {
 		g.enemies = append(g.enemies, &Enemy{
 			X:            ScreenWidth / 2,
@@ -235,24 +257,36 @@ func (g *Game) Update() error {
 func (g *Game) updatePlaying() {
 	mx, my, pressed := pointerPos()
 
-	wasDragging := g.dragging
-	if pressed && g.charge > 0 {
-		if !g.dragging {
+	// Only sample the pointer while it's actually pressed. On touch, the
+	// release frame returns (0,0) because the touch ID is already gone — if
+	// we used that as the slash endpoint, every strike would shoot toward
+	// the top-left of the screen. Holding the last pressed-frame value
+	// instead gives us a valid release position for fireSlash.
+	if pressed {
+		g.pointerX, g.pointerY = mx, my
+		if !g.dragging && g.stock > 0 {
 			g.dragging = true
-			g.prevMX, g.prevMY = mx, my
+			g.slashStartX, g.slashStartY = mx, my
 			g.hue += 47 + g.rng.Float64()*30
 		}
-		g.cutLine(g.prevMX, g.prevMY, mx, my)
-		g.prevMX, g.prevMY = mx, my
-	} else {
+	} else if g.dragging {
+		g.fireSlash(g.slashStartX, g.slashStartY, g.pointerX, g.pointerY)
 		g.dragging = false
 	}
-	if wasDragging && !g.dragging {
-		g.claimEnclosure()
-	}
 
-	if !pressed {
-		g.charge = math.Min(MaxCharge, g.charge+ChargeRecover)
+	g.updateSlashes()
+
+	// Stock refills continuously toward MaxStock. ReloadFrames is the total
+	// time to go from empty to full, so per-frame progress scales with the
+	// number of stocks.
+	if g.stock < MaxStock {
+		g.reloadProgress += float64(MaxStock) / float64(ReloadFrames)
+		for g.reloadProgress >= 1.0 && g.stock < MaxStock {
+			g.stock++
+			g.reloadProgress -= 1.0
+		}
+	} else {
+		g.reloadProgress = 0
 	}
 
 	for _, e := range g.enemies {
@@ -310,24 +344,93 @@ func (g *Game) updatePlaying() {
 	}
 }
 
-func (g *Game) cutLine(x0, y0, x1, y1 int) {
+// fireSlash spawns a slash whose center sits at the midpoint of the drag and
+// whose direction matches the drag, with a fixed total length (SlashLength).
+// Drag distance only conveys "which way and where" — the beam itself is
+// always the same size, so a flick produces a shockwave equally as long as a
+// full swipe. Drags shorter than SlashMinLength are ignored (direction
+// unstable, no stock cost). Painting and claim happen in updateSlashes; this
+// only registers the strike and burns one stock.
+func (g *Game) fireSlash(x0, y0, x1, y1 int) {
+	if g.stock <= 0 {
+		return
+	}
 	dx := float64(x1 - x0)
 	dy := float64(y1 - y0)
-	dist := math.Sqrt(dx*dx + dy*dy)
-
-	cost := dist
-	if cost > g.charge {
-		cost = g.charge
+	dist := math.Hypot(dx, dy)
+	if dist < SlashMinLength {
+		return
 	}
-	g.charge -= cost
+	nx := dx / dist
+	ny := dy / dist
+	midX := (float64(x0) + float64(x1)) / 2
+	midY := (float64(y0) + float64(y1)) / 2
+	half := float64(SlashLength) / 2
+	g.stock--
+	g.slashes = append(g.slashes, &Slash{
+		X0:  midX - nx*half,
+		Y0:  midY - ny*half,
+		X1:  midX + nx*half,
+		Y1:  midY + ny*half,
+		Hue: g.hue,
+	})
+}
 
-	steps := int(dist) + 1
+// updateSlashes advances every active slash by one frame. While the tip is
+// still extending it burns the newly-covered segment into the grid; the
+// frame the tip reaches the end it runs claimEnclosure once; afterwards it
+// just decays for SlashGlowFrames before being removed. Stock is unrelated:
+// it ticks down at fire time and refills on its own schedule.
+func (g *Game) updateSlashes() {
+	if len(g.slashes) == 0 {
+		return
+	}
+	keep := g.slashes[:0]
+	for _, s := range g.slashes {
+		prev := s.Frame
+		s.Frame++
+		if prev < SlashRevealFrames {
+			t0 := float64(prev) / float64(SlashRevealFrames)
+			t1 := float64(s.Frame) / float64(SlashRevealFrames)
+			if t1 > 1 {
+				t1 = 1
+			}
+			g.burnSegment(s, t0, t1)
+			if !s.claimed && t1 >= 1 {
+				saved := g.hue
+				g.hue = s.Hue
+				g.claimEnclosure()
+				g.hue = saved
+				s.claimed = true
+			}
+		}
+		if s.Frame <= SlashRevealFrames+SlashGlowFrames {
+			keep = append(keep, s)
+		}
+	}
+	g.slashes = keep
+}
+
+// burnSegment illuminates the portion of slash s between parametric points
+// t0 and t1 (0=anchor, 1=tip). Temporarily borrows the global hue so the
+// existing illuminate() routine paints in this slash's color.
+func (g *Game) burnSegment(s *Slash, t0, t1 float64) {
+	if t1 <= t0 {
+		return
+	}
+	dx := s.X1 - s.X0
+	dy := s.Y1 - s.Y0
+	segLen := math.Hypot(dx, dy) * (t1 - t0)
+	steps := int(segLen) + 1
+	saved := g.hue
+	g.hue = s.Hue
 	for i := 0; i <= steps; i++ {
-		t := float64(i) / float64(steps)
-		px := int(float64(x0) + t*dx)
-		py := int(float64(y0) + t*dy)
+		u := t0 + (t1-t0)*float64(i)/float64(steps)
+		px := int(s.X0 + dx*u)
+		py := int(s.Y0 + dy*u)
 		g.illuminate(px, py)
 	}
+	g.hue = saved
 }
 
 func (g *Game) illuminate(px, py int) {
@@ -631,10 +734,101 @@ func (g *Game) Draw(screen *ebiten.Image) {
 			color.RGBA{0, 0, 0, alpha}, true)
 	}
 
-	chargeW := float32(220.0)
-	ratio := float32(g.charge / MaxCharge)
-	vector.DrawFilledRect(screen, 10, 10, chargeW, 8, color.RGBA{40, 40, 50, 220}, false)
-	vector.DrawFilledRect(screen, 10, 10, chargeW*ratio, 8, color.RGBA{200, 230, 255, 240}, false)
+	// Active slashes: the beam fans out symmetrically from the midpoint, then
+	// fades. With SlashRevealFrames=1 the line snaps to full length on the
+	// first drawn frame; the formula still uses t so a longer Reveal would
+	// animate the two tips outward. A brief shockwave ring at the midpoint
+	// sells the "impact" of the strike.
+	for _, sl := range g.slashes {
+		t := float64(sl.Frame) / float64(SlashRevealFrames)
+		if t > 1 {
+			t = 1
+		}
+		midX := (sl.X0 + sl.X1) / 2
+		midY := (sl.Y0 + sl.Y1) / 2
+		leftX := float32(midX + (sl.X0-midX)*t)
+		leftY := float32(midY + (sl.Y0-midY)*t)
+		rightX := float32(midX + (sl.X1-midX)*t)
+		rightY := float32(midY + (sl.Y1-midY)*t)
+
+		var alpha uint8 = 240
+		width := float32(4)
+		if sl.Frame > SlashRevealFrames {
+			gp := float64(sl.Frame-SlashRevealFrames) / float64(SlashGlowFrames)
+			if gp > 1 {
+				gp = 1
+			}
+			alpha = uint8(220 * (1 - gp))
+			width = 4 - 2.5*float32(gp)
+		}
+		vector.StrokeLine(screen, leftX, leftY, rightX, rightY,
+			width, color.RGBA{255, 255, 255, alpha}, true)
+
+		// Shockwave ring: widens and fades over the first few frames.
+		if sl.Frame <= 4 {
+			r := float32(6 + sl.Frame*7)
+			a := uint8(150 - sl.Frame*30)
+			vector.StrokeCircle(screen, float32(midX), float32(midY), r, 2,
+				color.RGBA{255, 255, 255, a}, true)
+		}
+	}
+
+	// Drag preview. Shows two things simultaneously:
+	//   - the actual drag segment (start -> current pointer) as a small bright
+	//     line, so the player feels the strike forming under their finger;
+	//   - a faint ghost of the full slash that will fire (midpoint-centered,
+	//     symmetric, SlashLength long) so they can aim the shockwave precisely.
+	if g.state == StatePlaying && g.dragging {
+		sx := float32(g.slashStartX)
+		sy := float32(g.slashStartY)
+		px := float32(g.pointerX)
+		py := float32(g.pointerY)
+		dxp := float64(px - sx)
+		dyp := float64(py - sy)
+		dist := math.Hypot(dxp, dyp)
+
+		if dist >= SlashMinLength {
+			nx := dxp / dist
+			ny := dyp / dist
+			mx := (float64(sx) + float64(px)) / 2
+			my := (float64(sy) + float64(py)) / 2
+			half := float64(SlashLength) / 2
+			gx0 := float32(mx - nx*half)
+			gy0 := float32(my - ny*half)
+			gx1 := float32(mx + nx*half)
+			gy1 := float32(my + ny*half)
+			vector.StrokeLine(screen, gx0, gy0, gx1, gy1, 1,
+				color.RGBA{255, 255, 255, 70}, true)
+		}
+		vector.StrokeLine(screen, sx, sy, px, py, 2.5,
+			color.RGBA{255, 255, 255, 220}, true)
+		vector.DrawFilledCircle(screen, sx, sy, 3, color.RGBA{255, 255, 255, 230}, true)
+	}
+
+	// Stock pips + reload progress bar. Filled pip = ready to slash;
+	// hollow pip = waiting on reload.
+	pipY := float32(14)
+	pipR := float32(5)
+	pipGap := float32(16)
+	for i := 0; i < MaxStock; i++ {
+		cx := 14 + float32(i)*pipGap
+		if i < g.stock {
+			vector.DrawFilledCircle(screen, cx, pipY, pipR,
+				color.RGBA{200, 230, 255, 240}, true)
+		} else {
+			vector.StrokeCircle(screen, cx, pipY, pipR, 1.5,
+				color.RGBA{120, 140, 160, 220}, true)
+		}
+	}
+	if g.stock < MaxStock {
+		barX := 14 + float32(MaxStock)*pipGap + 4
+		barY := pipY - 3
+		barW := float32(60)
+		vector.DrawFilledRect(screen, barX, barY, barW, 6,
+			color.RGBA{40, 40, 50, 220}, false)
+		vector.DrawFilledRect(screen, barX, barY, barW*float32(g.reloadProgress), 6,
+			color.RGBA{200, 230, 255, 200}, false)
+	}
 
 	s := stages[g.currentStage]
 	msg := fmt.Sprintf("Stage %d/%d   Light %3.0f%% / %2.0f%%   Time %4.1fs",
@@ -649,8 +843,8 @@ func (g *Game) Draw(screen *ebiten.Image) {
 	switch g.state {
 	case StateTitle:
 		drawCenter(screen, "R I F T", ScreenHeight/2-40)
-		drawCenter(screen, "Drag to cut the dark. Encircle to claim.", ScreenHeight/2-10)
-		drawCenter(screen, "Reach the light threshold before time runs out.", ScreenHeight/2+4)
+		drawCenter(screen, "Drag a straight slash. 3 strikes per reload.", ScreenHeight/2-10)
+		drawCenter(screen, "Carve the dark and encircle it before time runs out.", ScreenHeight/2+4)
 		drawCenter(screen, "[Click or Space to start]", ScreenHeight/2+34)
 	case StateCleared:
 		next := g.currentStage + 2 // 1-indexed display of the next stage
