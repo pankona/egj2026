@@ -37,30 +37,45 @@ const (
 	EnemyEdgeBoost   = 3.5   // multiplier for cells on the light boundary
 	EnemyHomingPx    = 260.0 // search radius for nearest light edge
 	EnemyRetargetSec = 0.75  // re-pick a target this often
+
+	// Bind: enemies form a dark enclosure as the mirror image of the player's
+	// claim. The phase loops Roaming -> Warning -> Holding; on Holding's last
+	// frame, completed edges + existing dark cells are flood-filled to seal
+	// any small lit pockets to black.
+	BindRoamFrames     = 360 // patrol length before all enemies anchor (6s)
+	BindWarnFrames     = 60  // pulse-only warning before the line starts forming
+	BindHoldFrames     = 120 // line growth phase; seal happens on its last frame
+	BindRangeCells     = 60  // skip pairs farther apart than this (cells)
+	BindEdgeWidthCells = 1   // half-thickness of the dark line when rasterized
 )
 
 // Stage describes one playable level. The 10-stage progression in the GDD
 // builds enemy count, speed, and the light-percentage target side by side.
 // Stage 10 (the giant boss) will plug into this same shape later.
 type Stage struct {
-	Enemies      int
-	EnemySpeed   float64
-	WinThreshold float64
-	TimeLimit    float64
-	Boss         bool // ignore Enemies/WinThreshold; spawn one giant and clear on seal
+	Enemies    int
+	EnemySpeed float64
+	TimeLimit  float64
+	Boss       bool // spawn one giant; same clear-on-empty rule applies
+	EnableBind bool // enemies periodically anchor and weave a dark enclosure
+
+	// HarmlessEnemy makes spawned enemies passive: they drift but their
+	// erosion footprint is zero. Used for the stage-1 tutorial so the
+	// player can practice the clear loop (slash -> claim) without pressure.
+	HarmlessEnemy bool
 }
 
 var stages = []Stage{
-	{Enemies: 0, EnemySpeed: 0.00, WinThreshold: 0.20, TimeLimit: 30}, // 1 tutorial
-	{Enemies: 1, EnemySpeed: 0.40, WinThreshold: 0.30, TimeLimit: 45}, // 2
-	{Enemies: 2, EnemySpeed: 0.40, WinThreshold: 0.30, TimeLimit: 45}, // 3
-	{Enemies: 2, EnemySpeed: 0.55, WinThreshold: 0.40, TimeLimit: 55}, // 4
-	{Enemies: 3, EnemySpeed: 0.55, WinThreshold: 0.40, TimeLimit: 55}, // 5
-	{Enemies: 3, EnemySpeed: 0.70, WinThreshold: 0.50, TimeLimit: 60}, // 6
-	{Enemies: 4, EnemySpeed: 0.70, WinThreshold: 0.50, TimeLimit: 60}, // 7
-	{Enemies: 3, EnemySpeed: 0.90, WinThreshold: 0.60, TimeLimit: 65}, // 8
-	{Enemies: 4, EnemySpeed: 0.90, WinThreshold: 0.60, TimeLimit: 65}, // 9
-	{Enemies: 0, EnemySpeed: 0.35, WinThreshold: 0.70, TimeLimit: 90, Boss: true}, // 10 boss
+	{Enemies: 1, EnemySpeed: 0.20, TimeLimit: 30, HarmlessEnemy: true},   // 1 tutorial: one slow harmless target
+	{Enemies: 1, EnemySpeed: 0.40, TimeLimit: 45},                        // 2
+	{Enemies: 2, EnemySpeed: 0.40, TimeLimit: 45},                        // 3
+	{Enemies: 2, EnemySpeed: 0.55, TimeLimit: 55, EnableBind: true},      // 4 bind intro
+	{Enemies: 3, EnemySpeed: 0.55, TimeLimit: 55, EnableBind: true},      // 5
+	{Enemies: 3, EnemySpeed: 0.70, TimeLimit: 60, EnableBind: true},      // 6
+	{Enemies: 4, EnemySpeed: 0.70, TimeLimit: 60, EnableBind: true},      // 7
+	{Enemies: 3, EnemySpeed: 0.90, TimeLimit: 65, EnableBind: true},      // 8
+	{Enemies: 4, EnemySpeed: 0.90, TimeLimit: 65, EnableBind: true},      // 9
+	{Enemies: 0, EnemySpeed: 0.35, TimeLimit: 90, Boss: true},            // 10 boss
 }
 
 // DebugMode is initialized in debug_mode_default.go / debug_mode_wasm.go.
@@ -94,6 +109,10 @@ type Enemy struct {
 	TargetX      int // grid cell
 	TargetY      int
 	TargetAge    int // frames since last retarget
+
+	// ID is a stable identifier for severed-pair tracking; assigned in
+	// loadStage. Zero means "not assigned" (boss/tutorial enemies).
+	ID int
 }
 
 type GameState int
@@ -128,6 +147,12 @@ type Game struct {
 	lightPercent       float64
 	rng                *rand.Rand
 	postClearCooldown  int
+
+	// Bind phase state. All enemies on a bind-enabled stage share one timer:
+	// 0 (Roaming) -> 1 (Warning) -> 2 (Holding) -> seal -> 0.
+	bindPhase       int
+	bindPhaseFrames int
+	severedPairs    map[[2]int]bool
 }
 
 func newGame() *Game {
@@ -169,6 +194,9 @@ func (g *Game) loadStage(idx int) {
 
 	g.enemies = g.enemies[:0]
 	g.slashes = g.slashes[:0]
+	g.bindPhase = 0
+	g.bindPhaseFrames = 0
+	g.severedPairs = map[[2]int]bool{}
 	if s.Boss {
 		g.enemies = append(g.enemies, &Enemy{
 			X:            ScreenWidth / 2,
@@ -182,15 +210,20 @@ func (g *Game) loadStage(idx int) {
 		})
 		return
 	}
+	effectR := float64(EnemyErodeRadius)
+	if s.HarmlessEnemy {
+		effectR = 0
+	}
 	for i := 0; i < s.Enemies; i++ {
 		g.enemies = append(g.enemies, &Enemy{
+			ID:           i + 1,
 			X:            g.rng.Float64()*float64(ScreenWidth-160) + 80,
 			Y:            g.rng.Float64()*float64(ScreenHeight-160) + 80,
 			VX:           (g.rng.Float64()*2 - 1) * s.EnemySpeed,
 			VY:           (g.rng.Float64()*2 - 1) * s.EnemySpeed,
 			Speed:        s.EnemySpeed,
 			Radius:       12,
-			EffectRadius: EnemyErodeRadius,
+			EffectRadius: effectR,
 		})
 	}
 }
@@ -290,7 +323,15 @@ func (g *Game) updatePlaying() {
 		g.reloadProgress = 0
 	}
 
+	g.advanceBindPhase()
+	anchored := g.isAnchoring()
+
 	for _, e := range g.enemies {
+		if anchored && !e.IsBoss {
+			// Vertices freeze while the dark line forms — no steering,
+			// no movement, no erosion. The boss never anchors.
+			continue
+		}
 		g.steerEnemy(e)
 		e.X += e.VX
 		e.Y += e.VY
@@ -332,14 +373,9 @@ func (g *Game) updatePlaying() {
 	}
 	g.lightPercent = float64(count) / float64(total)
 
-	s := stages[g.currentStage]
-	cleared := false
-	if s.Boss {
-		cleared = len(g.enemies) == 0
-	} else {
-		cleared = g.lightPercent >= s.WinThreshold
-	}
-	if cleared {
+	// Unified clear rule: every stage (including the boss) is cleared the
+	// frame no enemies remain. Light percent is now a feedback HUD only.
+	if len(g.enemies) == 0 {
 		g.state = StateCleared
 		g.postClearCooldown = 60
 	}
@@ -368,13 +404,39 @@ func (g *Game) fireSlash(x0, y0, x1, y1 int) {
 	midY := (float64(y0) + float64(y1)) / 2
 	half := float64(SlashLength) / 2
 	g.stock--
+	sx0 := midX - nx*half
+	sy0 := midY - ny*half
+	sx1 := midX + nx*half
+	sy1 := midY + ny*half
 	g.slashes = append(g.slashes, &Slash{
-		X0:  midX - nx*half,
-		Y0:  midY - ny*half,
-		X1:  midX + nx*half,
-		Y1:  midY + ny*half,
+		X0:  sx0,
+		Y0:  sy0,
+		X1:  sx1,
+		Y1:  sy1,
 		Hue: g.hue,
 	})
+
+	// Anchored enemies are vulnerable: a slash that grazes them removes the
+	// vertex (and any pair that included it stops contributing to the seal).
+	// Sever any remaining dark lines that the beam crossed. Both checks are
+	// gated on isAnchoring so during normal patrol the slash still only
+	// affects light, not enemies.
+	if g.isAnchoring() {
+		bladePx := float64(BladeRadius * CellSize)
+		survivors := g.enemies[:0]
+		for _, e := range g.enemies {
+			if !e.IsBoss && pointSegmentDistance(e.X, e.Y, sx0, sy0, sx1, sy1) <= e.Radius+bladePx {
+				continue // sealed/cut: this anchored enemy is removed
+			}
+			survivors = append(survivors, e)
+		}
+		g.enemies = survivors
+		for _, pair := range g.bindEdgesNow() {
+			if segmentsIntersect(pair[0].X, pair[0].Y, pair[1].X, pair[1].Y, sx0, sy0, sx1, sy1) {
+				g.severedPairs[pairKey(pair[0].ID, pair[1].ID)] = true
+			}
+		}
+	}
 }
 
 // updateSlashes advances every active slash by one frame. While the tip is
@@ -597,12 +659,12 @@ func (g *Game) erodeAround(x, y, radius float64) {
 
 // claimEnclosure splits the playfield (everything inside the always-wall
 // 1-cell border ring) into 4-connected dark components and claims every
-// component except the largest one. The largest component is treated as
-// "the outside"; smaller pockets are halos the player closed off with
-// slashes — either fully enclosed mid-screen, or against the border. This
-// also handles the "slash + border" case naturally: as soon as a slash
-// chops a sliver off the playfield, that sliver becomes a separate, smaller
-// component and gets claimed.
+// component that does NOT touch the playfield border. Components touching
+// the border are treated as "outside" and left alone, so two parallel
+// slashes that just split the field into bands no longer cheese the level
+// — only a fully enclosed pocket (carved entirely by slashes, with no
+// border contact) seals. This forces the player to commit to the 3-line
+// triangle ritual rather than chopping the screen in half.
 //
 // Enemies whose centers fall inside a claimed component are sealed
 // (removed). Run once per slash, after the beam reaches full length.
@@ -610,7 +672,7 @@ func (g *Game) claimEnclosure() {
 	const wall = WallLightThreshold
 
 	var compID [GridWidth][GridHeight]int // 0 = wall or border
-	var compSizes []int                   // index = id-1
+	var compTouchesBorder []bool          // index = id-1
 	nextID := 1
 	queue := make([][2]int, 0, 512)
 
@@ -621,11 +683,13 @@ func (g *Game) claimEnclosure() {
 			}
 			compID[sx][sy] = nextID
 			queue = append(queue[:0], [2]int{sx, sy})
-			size := 0
+			touchesBorder := false
 			for len(queue) > 0 {
 				p := queue[0]
 				queue = queue[1:]
-				size++
+				if p[0] == 1 || p[0] == GridWidth-2 || p[1] == 1 || p[1] == GridHeight-2 {
+					touchesBorder = true
+				}
 				for _, d := range [4][2]int{{1, 0}, {-1, 0}, {0, 1}, {0, -1}} {
 					nx, ny := p[0]+d[0], p[1]+d[1]
 					if nx < 1 || nx >= GridWidth-1 || ny < 1 || ny >= GridHeight-1 {
@@ -638,22 +702,13 @@ func (g *Game) claimEnclosure() {
 					queue = append(queue, [2]int{nx, ny})
 				}
 			}
-			compSizes = append(compSizes, size)
+			compTouchesBorder = append(compTouchesBorder, touchesBorder)
 			nextID++
 		}
 	}
 
-	if len(compSizes) <= 1 {
-		return // playfield isn't split — nothing to claim
-	}
-
-	// Find the biggest component; treat it as the "outside."
-	largestID, largestSize := 1, compSizes[0]
-	for i, s := range compSizes {
-		if s > largestSize {
-			largestID = i + 1
-			largestSize = s
-		}
+	if len(compTouchesBorder) == 0 {
+		return
 	}
 
 	r, gC, b := hueToRGB(g.hue)
@@ -662,7 +717,7 @@ func (g *Game) claimEnclosure() {
 	for x := 1; x < GridWidth-1; x++ {
 		for y := 1; y < GridHeight-1; y++ {
 			id := compID[x][y]
-			if id == 0 || id == largestID {
+			if id == 0 || compTouchesBorder[id-1] {
 				continue
 			}
 			inside[x][y] = true
@@ -686,6 +741,240 @@ func (g *Game) claimEnclosure() {
 		survivors = append(survivors, e)
 	}
 	g.enemies = survivors
+}
+
+// isAnchoring reports whether enemies are currently locked in place for a
+// bind attempt (phase 1 or 2 on a bind-enabled, non-boss stage).
+func (g *Game) isAnchoring() bool {
+	s := stages[g.currentStage]
+	if !s.EnableBind || s.Boss {
+		return false
+	}
+	return g.bindPhase != 0
+}
+
+// advanceBindPhase runs the shared Roaming -> Warning -> Holding -> seal
+// loop for the current stage. All enemies share a single timer so the
+// "everyone freezes at once" choreography is predictable. When the seal
+// frame lands, bindEnclosure runs and enemies are kicked back into motion
+// with fresh randomized velocities so the next patrol doesn't replay the
+// same trajectory.
+func (g *Game) advanceBindPhase() {
+	s := stages[g.currentStage]
+	if !s.EnableBind || s.Boss {
+		g.bindPhase = 0
+		g.bindPhaseFrames = 0
+		return
+	}
+	if len(g.enemies) < 2 {
+		// A solo enemy can't form a polygon — fall back to plain patrol.
+		g.bindPhase = 0
+		g.bindPhaseFrames = 0
+		if len(g.severedPairs) > 0 {
+			g.severedPairs = map[[2]int]bool{}
+		}
+		return
+	}
+	g.bindPhaseFrames++
+	switch g.bindPhase {
+	case 0: // Roaming
+		if g.bindPhaseFrames >= BindRoamFrames {
+			g.bindPhase = 1
+			g.bindPhaseFrames = 0
+			for _, e := range g.enemies {
+				e.VX, e.VY = 0, 0
+				e.HasTarget = false
+			}
+		}
+	case 1: // Warning (pulse only, no line yet)
+		if g.bindPhaseFrames >= BindWarnFrames {
+			g.bindPhase = 2
+			g.bindPhaseFrames = 0
+		}
+	case 2: // Holding (dark line grows, seal at end)
+		if g.bindPhaseFrames >= BindHoldFrames {
+			g.bindEnclosure()
+			g.bindPhase = 0
+			g.bindPhaseFrames = 0
+			g.severedPairs = map[[2]int]bool{}
+			for _, e := range g.enemies {
+				a := g.rng.Float64() * math.Pi * 2
+				e.VX = math.Cos(a) * e.Speed
+				e.VY = math.Sin(a) * e.Speed
+			}
+		}
+	}
+}
+
+// bindEdgesNow returns the active vertex pairs for the current bind attempt.
+// Pairs are skipped if either endpoint is too far apart or the pair has
+// been severed by a player slash. Returns nil during Roaming.
+func (g *Game) bindEdgesNow() [][2]*Enemy {
+	if !g.isAnchoring() {
+		return nil
+	}
+	maxPx := float64(BindRangeCells * CellSize)
+	var pairs [][2]*Enemy
+	for i := 0; i < len(g.enemies); i++ {
+		a := g.enemies[i]
+		if a.IsBoss {
+			continue
+		}
+		for j := i + 1; j < len(g.enemies); j++ {
+			b := g.enemies[j]
+			if b.IsBoss {
+				continue
+			}
+			if math.Hypot(a.X-b.X, a.Y-b.Y) > maxPx {
+				continue
+			}
+			if g.severedPairs[pairKey(a.ID, b.ID)] {
+				continue
+			}
+			pairs = append(pairs, [2]*Enemy{a, b})
+		}
+	}
+	return pairs
+}
+
+func pairKey(a, b int) [2]int {
+	if a < b {
+		return [2]int{a, b}
+	}
+	return [2]int{b, a}
+}
+
+// bindEnclosure is the mirror of claimEnclosure: completed bind edges plus
+// already-dark cells form the wall set, and any small lit pocket that gets
+// cut off from the largest lit region is dropped to Light=0.
+func (g *Game) bindEnclosure() {
+	edges := g.bindEdgesNow()
+	if len(edges) == 0 {
+		return
+	}
+	const wall = WallLightThreshold
+	var dark [GridWidth][GridHeight]bool
+	for x := 1; x < GridWidth-1; x++ {
+		for y := 1; y < GridHeight-1; y++ {
+			if g.grid[x][y].Light < wall {
+				dark[x][y] = true
+			}
+		}
+	}
+	for _, pair := range edges {
+		g.rasterizeBindLine(pair[0].X, pair[0].Y, pair[1].X, pair[1].Y, &dark)
+	}
+
+	var compID [GridWidth][GridHeight]int
+	var compSizes []int
+	nextID := 1
+	queue := make([][2]int, 0, 512)
+	for sx := 1; sx < GridWidth-1; sx++ {
+		for sy := 1; sy < GridHeight-1; sy++ {
+			if compID[sx][sy] != 0 || dark[sx][sy] {
+				continue
+			}
+			compID[sx][sy] = nextID
+			queue = append(queue[:0], [2]int{sx, sy})
+			size := 0
+			for len(queue) > 0 {
+				p := queue[0]
+				queue = queue[1:]
+				size++
+				for _, d := range [4][2]int{{1, 0}, {-1, 0}, {0, 1}, {0, -1}} {
+					nx, ny := p[0]+d[0], p[1]+d[1]
+					if nx < 1 || nx >= GridWidth-1 || ny < 1 || ny >= GridHeight-1 {
+						continue
+					}
+					if compID[nx][ny] != 0 || dark[nx][ny] {
+						continue
+					}
+					compID[nx][ny] = nextID
+					queue = append(queue, [2]int{nx, ny})
+				}
+			}
+			compSizes = append(compSizes, size)
+			nextID++
+		}
+	}
+	if len(compSizes) <= 1 {
+		return // the lit area wasn't actually severed
+	}
+	largestID, largestSize := 1, compSizes[0]
+	for i, s := range compSizes {
+		if s > largestSize {
+			largestID = i + 1
+			largestSize = s
+		}
+	}
+	for x := 1; x < GridWidth-1; x++ {
+		for y := 1; y < GridHeight-1; y++ {
+			id := compID[x][y]
+			if id == 0 || id == largestID {
+				continue
+			}
+			g.grid[x][y].Light = 0
+		}
+	}
+}
+
+func (g *Game) rasterizeBindLine(x0, y0, x1, y1 float64, dark *[GridWidth][GridHeight]bool) {
+	length := math.Hypot(x1-x0, y1-y0)
+	steps := int(length) + 1
+	for i := 0; i <= steps; i++ {
+		u := float64(i) / float64(steps)
+		px := x0 + (x1-x0)*u
+		py := y0 + (y1-y0)*u
+		cx := int(px) / CellSize
+		cy := int(py) / CellSize
+		for ddx := -BindEdgeWidthCells; ddx <= BindEdgeWidthCells; ddx++ {
+			for ddy := -BindEdgeWidthCells; ddy <= BindEdgeWidthCells; ddy++ {
+				x := cx + ddx
+				y := cy + ddy
+				if x < 1 || x >= GridWidth-1 || y < 1 || y >= GridHeight-1 {
+					continue
+				}
+				if ddx*ddx+ddy*ddy > BindEdgeWidthCells*BindEdgeWidthCells {
+					continue
+				}
+				dark[x][y] = true
+			}
+		}
+	}
+}
+
+// pointSegmentDistance is the shortest distance from (px,py) to the segment
+// (x0,y0)-(x1,y1). Used for "did the slash beam touch this anchored enemy."
+func pointSegmentDistance(px, py, x0, y0, x1, y1 float64) float64 {
+	dx := x1 - x0
+	dy := y1 - y0
+	if dx == 0 && dy == 0 {
+		return math.Hypot(px-x0, py-y0)
+	}
+	t := ((px-x0)*dx + (py-y0)*dy) / (dx*dx + dy*dy)
+	if t < 0 {
+		t = 0
+	} else if t > 1 {
+		t = 1
+	}
+	cx := x0 + t*dx
+	cy := y0 + t*dy
+	return math.Hypot(px-cx, py-cy)
+}
+
+// segmentsIntersect tests strict (non-collinear) intersection between two
+// segments. Used to detect "did the slash cut this dark line".
+func segmentsIntersect(ax, ay, bx, by, cx, cy, dxp, dyp float64) bool {
+	d1 := cross2(dxp-cx, dyp-cy, ax-cx, ay-cy)
+	d2 := cross2(dxp-cx, dyp-cy, bx-cx, by-cy)
+	d3 := cross2(bx-ax, by-ay, cx-ax, cy-ay)
+	d4 := cross2(bx-ax, by-ay, dxp-ax, dyp-ay)
+	return ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) &&
+		((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))
+}
+
+func cross2(ax, ay, bx, by float64) float64 {
+	return ax*by - ay*bx
 }
 
 func hueToRGB(h float64) (float32, float32, float32) {
@@ -741,23 +1030,180 @@ func (g *Game) Draw(screen *ebiten.Image) {
 	vector.DrawFilledRect(screen, 0, 0, CellSize, ScreenHeight, frame, false)
 	vector.DrawFilledRect(screen, ScreenWidth-CellSize, 0, CellSize, ScreenHeight, frame, false)
 
+	// Anchor pulse: drawn UNDER the enemies so the vertex circle stays
+	// visually crisp on top. Pulses faster as the seal approaches, and the
+	// Warning phase uses a smaller/dimmer ring so the player can tell
+	// "they're about to commit" vs "the line is forming now."
+	if g.isAnchoring() {
+		pulse := 0.5 + 0.5*math.Sin(float64(g.bindPhaseFrames)*0.2)
+		scale := float32(1.0)
+		if g.bindPhase == 1 {
+			scale = 0.6
+		}
+		auraR := (24 + float32(pulse)*10) * scale
+		auraA := uint8((50 + pulse*60) * float64(scale))
+		for _, e := range g.enemies {
+			if e.IsBoss {
+				continue
+			}
+			vector.DrawFilledCircle(screen, float32(e.X), float32(e.Y), auraR,
+				color.RGBA{70, 25, 90, auraA}, true)
+		}
+	}
+
+	// Lighting model: scan the whole grid for lit cells with linear falloff
+	// (so a slash anywhere on screen reaches every enemy). The weighted
+	// centroid gives a "light direction" used for Lambertian shading, but
+	// we also split the energy into ambient (omnidirectional) and
+	// directional based on how concentrated the light is — measured by
+	// |centroidVector| / (totalLight * avgDistance). A single slash gives
+	// a strong directional with no ambient (lit hemisphere only); slashes
+	// surrounding the enemy give strong ambient with weak directional
+	// (the whole sphere reads). brightness is anchored on the strongest
+	// single cell contribution so any light on screen guarantees the
+	// enemy becomes visible at least faintly.
+	const lightMaxDist = 100.0 // cells; covers the screen diagonal
 	for _, e := range g.enemies {
-		cx := int(e.X) / CellSize
-		cy := int(e.Y) / CellSize
-		light := float32(0)
-		if cx >= 0 && cx < GridWidth && cy >= 0 && cy < GridHeight {
-			light = g.grid[cx][cy].Light
+		cx0 := int(e.X) / CellSize
+		cy0 := int(e.Y) / CellSize
+		var totalLight, totalDistance, dirX, dirY float32
+		var litR, litG, litB float32
+		var maxContribution float32
+		for x := 0; x < GridWidth; x++ {
+			for y := 0; y < GridHeight; y++ {
+				c := g.grid[x][y]
+				if c.Light <= 0 {
+					continue
+				}
+				dx := x - cx0
+				dy := y - cy0
+				d2 := dx*dx + dy*dy
+				if d2 == 0 {
+					continue
+				}
+				d := float32(math.Sqrt(float64(d2)))
+				if d > lightMaxDist {
+					continue
+				}
+				falloff := 1 - d/lightMaxDist
+				w := c.Light * falloff
+				totalLight += w
+				totalDistance += d * w
+				dirX += float32(dx) * w
+				dirY += float32(dy) * w
+				litR += c.R * w
+				litG += c.G * w
+				litB += c.B * w
+				if w > maxContribution {
+					maxContribution = w
+				}
+			}
 		}
-		alpha := uint8(40 + clamp01(light)*210)
-		r := float32(e.Radius)
-		vector.DrawFilledCircle(screen, float32(e.X), float32(e.Y), r,
-			color.RGBA{18, 14, 22, alpha}, true)
-		strokeW := float32(1.5)
+		if totalLight <= 0 {
+			continue
+		}
+		brightness := maxContribution
+		if brightness > 1 {
+			brightness = 1
+		}
+		dirLen := float32(math.Hypot(float64(dirX), float64(dirY)))
+		avgD := totalDistance / totalLight
+		// asymmetry: 1 when light is concentrated in one direction,
+		// 0 when sources surround the enemy symmetrically.
+		asymmetry := float32(0)
+		if avgD > 0.01 {
+			asymmetry = dirLen / (totalLight * avgD)
+			if asymmetry > 1 {
+				asymmetry = 1
+			}
+		}
+		var lnx, lny, lnz float32
+		if dirLen > 0.01 {
+			lx2D := dirX / dirLen
+			ly2D := dirY / dirLen
+			const lz = 0.5
+			lvlen := float32(math.Sqrt(float64(lx2D*lx2D+ly2D*ly2D) + lz*lz))
+			lnx = lx2D / lvlen
+			lny = ly2D / lvlen
+			lnz = float32(lz) / lvlen
+		}
+		sr := clamp01(litR/totalLight + 0.2)
+		sg := clamp01(litG/totalLight + 0.2)
+		sb := clamp01(litB/totalLight + 0.25)
+
+		ambient := brightness * (1 - asymmetry) * 0.85
+		directional := brightness * asymmetry
+
+		radius := float32(e.Radius)
+		stepPx := float32(1.5)
 		if e.IsBoss {
-			strokeW = 2.5
+			stepPx = 3.0
 		}
-		vector.StrokeCircle(screen, float32(e.X), float32(e.Y), r, strokeW,
-			color.RGBA{0, 0, 0, alpha}, true)
+		half := int(radius/stepPx) + 1
+		rectSize := stepPx * 1.4
+		r2 := radius * radius
+		for ix := -half; ix <= half; ix++ {
+			for iy := -half; iy <= half; iy++ {
+				sx := float32(ix) * stepPx
+				sy := float32(iy) * stepPx
+				d2f := sx*sx + sy*sy
+				if d2f > r2 {
+					continue
+				}
+				sz := float32(math.Sqrt(float64(r2 - d2f)))
+				nx := sx / radius
+				ny := sy / radius
+				nz := sz / radius
+				var lambert float32
+				if dirLen > 0.01 {
+					lambert = nx*lnx + ny*lny + nz*lnz
+					if lambert < 0 {
+						lambert = 0
+					}
+				}
+				intensity := ambient + directional*lambert
+				if intensity < 0.04 {
+					continue
+				}
+				vector.DrawFilledRect(screen,
+					float32(e.X)+sx-rectSize/2,
+					float32(e.Y)+sy-rectSize/2,
+					rectSize, rectSize,
+					color.RGBA{
+						uint8(clamp01(intensity*sr) * 255),
+						uint8(clamp01(intensity*sg) * 255),
+						uint8(clamp01(intensity*sb) * 255),
+						uint8(clamp01(intensity*1.5) * 220),
+					}, true)
+			}
+		}
+	}
+
+	// Dark lines: only visible during phase 2 (Holding), and they grow from
+	// the midpoint outward over BindHoldFrames. Drawn over enemies so the
+	// player sees the line connecting vertices, but under slashes so the
+	// player's white beam reads as the dominant action.
+	if g.isAnchoring() && g.bindPhase == 2 {
+		growthT := float64(g.bindPhaseFrames) / float64(BindHoldFrames)
+		if growthT > 1 {
+			growthT = 1
+		}
+		alpha := uint8(140 + growthT*100)
+		for _, pair := range g.bindEdgesNow() {
+			a, b := pair[0], pair[1]
+			midX := float32((a.X + b.X) / 2)
+			midY := float32((a.Y + b.Y) / 2)
+			ax := float32(a.X) - midX
+			ay := float32(a.Y) - midY
+			bx := float32(b.X) - midX
+			by := float32(b.Y) - midY
+			x0 := midX + ax*float32(growthT)
+			y0 := midY + ay*float32(growthT)
+			x1 := midX + bx*float32(growthT)
+			y1 := midY + by*float32(growthT)
+			vector.StrokeLine(screen, x0, y0, x1, y1, 2.5,
+				color.RGBA{40, 8, 55, alpha}, true)
+		}
 	}
 
 	// Active slashes: the beam fans out symmetrically from the midpoint, then
@@ -856,9 +1302,8 @@ func (g *Game) Draw(screen *ebiten.Image) {
 			color.RGBA{200, 230, 255, 200}, false)
 	}
 
-	s := stages[g.currentStage]
-	msg := fmt.Sprintf("Stage %d/%d   Light %3.0f%% / %2.0f%%   Time %4.1fs",
-		g.currentStage+1, len(stages), g.lightPercent*100, s.WinThreshold*100, g.stageTime)
+	msg := fmt.Sprintf("Stage %d/%d   Light %3.0f%%   Foes %d   Time %4.1fs",
+		g.currentStage+1, len(stages), g.lightPercent*100, len(g.enemies), g.stageTime)
 	ebitenutil.DebugPrintAt(screen, msg, 10, 24)
 
 	if DebugMode {
@@ -870,7 +1315,7 @@ func (g *Game) Draw(screen *ebiten.Image) {
 	case StateTitle:
 		drawCenter(screen, "R I F T", ScreenHeight/2-40)
 		drawCenter(screen, "Drag a straight slash. 3 strikes per reload.", ScreenHeight/2-10)
-		drawCenter(screen, "Carve the dark and encircle it before time runs out.", ScreenHeight/2+4)
+		drawCenter(screen, "Encircle the dark to seal every foe before time runs out.", ScreenHeight/2+4)
 		drawCenter(screen, "[Click or Space to start]", ScreenHeight/2+34)
 	case StateCleared:
 		next := g.currentStage + 2 // 1-indexed display of the next stage
