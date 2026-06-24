@@ -21,8 +21,8 @@ const (
 	GridWidth  = ScreenWidth / CellSize  // 80
 	GridHeight = ScreenHeight / CellSize // 60
 
-	MaxStock          = 3   // simultaneous slashes per reload cycle
-	ReloadFrames      = 180 // frames to refill from 0 to MaxStock
+	MaxStock          = 3   // slashes available per reload cycle
+	ReloadFrames      = 180 // frames from running dry to a full MaxStock refill
 	SlashMinLength    = 12  // px drag threshold; a flick is enough to fire
 	SlashLength       = 320 // px; every slash is this length, regardless of drag distance
 	SlashRevealFrames = 1   // frames for the beam to extend end-to-end (1 = instant snap)
@@ -276,14 +276,15 @@ func (g *Game) updatePlaying() {
 
 	g.updateSlashes()
 
-	// Stock refills continuously toward MaxStock. ReloadFrames is the total
-	// time to go from empty to full, so per-frame progress scales with the
-	// number of stocks.
-	if g.stock < MaxStock {
-		g.reloadProgress += float64(MaxStock) / float64(ReloadFrames)
-		for g.reloadProgress >= 1.0 && g.stock < MaxStock {
-			g.stock++
-			g.reloadProgress -= 1.0
+	// Reload is all-or-nothing: it only ticks once the magazine is empty, and
+	// when the bar fills it refills all MaxStock slashes at once. Trickle
+	// refills made the dry spell feel like death by a thousand cuts; this way
+	// players know exactly when their next burst lands.
+	if g.stock == 0 {
+		g.reloadProgress += 1.0 / float64(ReloadFrames)
+		if g.reloadProgress >= 1.0 {
+			g.stock = MaxStock
+			g.reloadProgress = 0
 		}
 	} else {
 		g.reloadProgress = 0
@@ -820,7 +821,7 @@ func (g *Game) Draw(screen *ebiten.Image) {
 				color.RGBA{120, 140, 160, 220}, true)
 		}
 	}
-	if g.stock < MaxStock {
+	if g.stock == 0 {
 		barX := 14 + float32(MaxStock)*pipGap + 4
 		barY := pipY - 3
 		barW := float32(60)
