@@ -65,6 +65,8 @@ make fmt            goimports -w .
 - ネイティブ: `DEBUG=1 go run .`
 - wasm: `http://localhost:18081/?debug=1`
 
+**ネイティブビルド (`go build` / `make build` / `make run`) はこの開発環境では確認しない**。配布形態が wasm 限定で、かつ WSL の開発機には `libXxf86vm` 等の X11 ライブラリが入っていないため、`go build ./...` は毎回リンカエラーで落ちる（環境問題で本件と無関係）。動作検証は常に `GOOS=js GOARCH=wasm go vet ./...`（= `make lint`）と `go test ./...`（= `make test`）で済ませる。
+
 ## コーディング規約
 
 - パッケージは `main` 1 つ。ファイルを分けるよりは関数で切る方針。WASM 固有処理だけビルドタグで切り出す (`debug_mode_*.go`)

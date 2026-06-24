@@ -84,6 +84,12 @@ var DebugMode bool
 type Cell struct {
 	Light   float32
 	R, G, B float32
+	// Claimed marks cells that were filled by claimEnclosure. The flag is the
+	// anchor reviewClaims() uses to decide whether a previously sealed pocket
+	// has been chewed open and should revert to darkness — the Light value
+	// alone isn't enough because a freshly burned slash cell looks identical
+	// to a claim cell while both are at 1.0.
+	Claimed bool
 }
 
 // Slash is one in-flight strike. It owns its own hue (captured at fire time so
@@ -354,6 +360,11 @@ func (g *Game) updatePlaying() {
 		}
 		g.erodeAround(e.X, e.Y, e.EffectRadius)
 	}
+
+	// Claims are not permanent — once the perimeter is chewed through, the
+	// pocket reverts. Runs after erosion so the same frame's damage is
+	// reflected immediately.
+	g.reviewClaims()
 
 	g.stageTime -= 1.0 / 60.0
 	if g.stageTime <= 0 {
@@ -725,22 +736,151 @@ func (g *Game) claimEnclosure() {
 			c := &g.grid[x][y]
 			c.Light = 1
 			c.R, c.G, c.B = r, gC, b
+			c.Claimed = true
 		}
 	}
 	if claimed == 0 {
 		return
 	}
 
+	// An enemy whose center sits directly on a wall cell (typically the just-
+	// burned slash beam) is neither "inside" nor part of any component, so a
+	// strict inside[cx][cy] test lets enemies riding the closing edge slip
+	// through. Fall back to 4-neighbor probing in that case: if any adjacent
+	// cell belongs to the claimed component, treat the enemy as sealed.
+	sealed := func(cx, cy int) bool {
+		if cx < 0 || cx >= GridWidth || cy < 0 || cy >= GridHeight {
+			return false
+		}
+		if inside[cx][cy] {
+			return true
+		}
+		for _, d := range [4][2]int{{1, 0}, {-1, 0}, {0, 1}, {0, -1}} {
+			nx, ny := cx+d[0], cy+d[1]
+			if nx < 0 || nx >= GridWidth || ny < 0 || ny >= GridHeight {
+				continue
+			}
+			if inside[nx][ny] {
+				return true
+			}
+		}
+		return false
+	}
 	survivors := g.enemies[:0]
 	for _, e := range g.enemies {
 		cx := int(e.X) / CellSize
 		cy := int(e.Y) / CellSize
-		if cx >= 0 && cx < GridWidth && cy >= 0 && cy < GridHeight && inside[cx][cy] {
+		if sealed(cx, cy) {
 			continue
 		}
 		survivors = append(survivors, e)
 	}
 	g.enemies = survivors
+}
+
+// reviewClaims re-evaluates every claimed pocket against the current grid
+// state and revokes any pocket whose perimeter has been gnawed open. The
+// rule is the mirror of claimEnclosure's original judgement: a claim is
+// only valid while its cells stay cut off from the playfield border by
+// wall cells. The moment an enemy chews enough of the surrounding slash
+// beam below WallLightThreshold to reconnect the pocket to the outside
+// dark region, the seal is forfeit and the pocket goes back to Light=0.
+//
+// This is what makes enemies actually dangerous: a finished triangle is
+// no longer a permanent score, it's territory that has to be defended.
+// Without re-evaluation, erodeAround would slowly carve holes in claim
+// borders but the inside cells would keep glowing forever.
+func (g *Game) reviewClaims() {
+	const wall = WallLightThreshold
+
+	// Pass 1: 4-connected components of dark cells, with a flag for whether
+	// each component reaches the playfield border (=is "outside").
+	var darkID [GridWidth][GridHeight]int
+	var darkTouchesBorder []bool
+	queue := make([][2]int, 0, 512)
+	nextID := 1
+	for sx := 1; sx < GridWidth-1; sx++ {
+		for sy := 1; sy < GridHeight-1; sy++ {
+			if darkID[sx][sy] != 0 || g.grid[sx][sy].Light >= wall {
+				continue
+			}
+			darkID[sx][sy] = nextID
+			queue = append(queue[:0], [2]int{sx, sy})
+			touches := false
+			for len(queue) > 0 {
+				p := queue[0]
+				queue = queue[1:]
+				if p[0] == 1 || p[0] == GridWidth-2 || p[1] == 1 || p[1] == GridHeight-2 {
+					touches = true
+				}
+				for _, d := range [4][2]int{{1, 0}, {-1, 0}, {0, 1}, {0, -1}} {
+					nx, ny := p[0]+d[0], p[1]+d[1]
+					if nx < 1 || nx >= GridWidth-1 || ny < 1 || ny >= GridHeight-1 {
+						continue
+					}
+					if darkID[nx][ny] != 0 || g.grid[nx][ny].Light >= wall {
+						continue
+					}
+					darkID[nx][ny] = nextID
+					queue = append(queue, [2]int{nx, ny})
+				}
+			}
+			darkTouchesBorder = append(darkTouchesBorder, touches)
+			nextID++
+		}
+	}
+
+	// Pass 2: 4-connected components of claimed cells. A component is
+	// "breached" if any of its cells has a 4-neighbor sitting in an
+	// outside dark component — meaning the pocket has been reconnected
+	// to the border.
+	var claimID [GridWidth][GridHeight]int
+	var breached []bool
+	nextID = 1
+	for sx := 0; sx < GridWidth; sx++ {
+		for sy := 0; sy < GridHeight; sy++ {
+			if claimID[sx][sy] != 0 || !g.grid[sx][sy].Claimed {
+				continue
+			}
+			claimID[sx][sy] = nextID
+			queue = append(queue[:0], [2]int{sx, sy})
+			open := false
+			for len(queue) > 0 {
+				p := queue[0]
+				queue = queue[1:]
+				for _, d := range [4][2]int{{1, 0}, {-1, 0}, {0, 1}, {0, -1}} {
+					nx, ny := p[0]+d[0], p[1]+d[1]
+					if nx < 0 || nx >= GridWidth || ny < 0 || ny >= GridHeight {
+						continue
+					}
+					if id := darkID[nx][ny]; id != 0 && darkTouchesBorder[id-1] {
+						open = true
+					}
+					if !g.grid[nx][ny].Claimed || claimID[nx][ny] != 0 {
+						continue
+					}
+					claimID[nx][ny] = nextID
+					queue = append(queue, [2]int{nx, ny})
+				}
+			}
+			breached = append(breached, open)
+			nextID++
+		}
+	}
+
+	// Pass 3: collapse breached components back to darkness.
+	for x := 0; x < GridWidth; x++ {
+		for y := 0; y < GridHeight; y++ {
+			id := claimID[x][y]
+			if id == 0 || !breached[id-1] {
+				continue
+			}
+			c := &g.grid[x][y]
+			c.Light = 0
+			c.Claimed = false
+			c.R, c.G, c.B = 0, 0, 0
+		}
+	}
 }
 
 // isAnchoring reports whether enemies are currently locked in place for a
@@ -913,7 +1053,9 @@ func (g *Game) bindEnclosure() {
 			if id == 0 || id == largestID {
 				continue
 			}
-			g.grid[x][y].Light = 0
+			c := &g.grid[x][y]
+			c.Light = 0
+			c.Claimed = false
 		}
 	}
 }
