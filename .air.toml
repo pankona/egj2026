@@ -1,0 +1,18 @@
+root = "."
+tmp_dir = ".air"
+
+[build]
+cmd = "make build-wasm && go build -o .air/devserver ./devserver"
+bin = ".air/devserver"
+include_ext = ["go", "html"]
+exclude_dir = ["dist", ".air", ".github", ".claude", "aimemo"]
+delay = 200
+stop_on_error = false
+kill_delay = "200ms"
+send_interrupt = true
+
+[log]
+time = true
+
+[misc]
+clean_on_exit = true

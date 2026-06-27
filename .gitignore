@@ -1,6 +1,10 @@
 # Build outputs
 dist/
 
+# air live-reload
+.air/
+air-errors.log
+
 # Binaries
 *.exe
 *.exe~
