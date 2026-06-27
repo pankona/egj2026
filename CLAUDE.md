@@ -55,6 +55,7 @@ make build          ネイティブバイナリを dist/rift に出力
 make build-wasm     wasm + wasm_exec.js + web/ を dist/ にまとめる
 make devserver      dist/ を localhost:18081 で配信
 make serve-wasm     build-wasm → devserver
+make watch          air で wasm を再ビルド + devserver を再起動 (初回のみ install-tools)
 make release        wasm をビルドして rift-<short-sha>.zip を作る
 make lint           GOOS=js GOARCH=wasm go vet ./...
 make test           go test -v ./...

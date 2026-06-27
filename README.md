@@ -26,4 +26,11 @@ make serve-wasm
 # → http://localhost:18081/
 ```
 
+ファイル保存ごとに wasm を再ビルド + devserver を再起動するホットリロードは air を使う (初回のみ `make install-tools`):
+
+```
+make watch
+# → http://localhost:18081/  保存で自動再ビルド、ブラウザは F5
+```
+
 他のターゲットは `Makefile` 参照。デバッグ表示は `DEBUG=1` または `?debug=1`。

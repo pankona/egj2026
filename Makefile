@@ -1,4 +1,4 @@
-.PHONY: lint test build build-wasm serve-wasm devserver run clean fmt install-tools
+.PHONY: lint test build build-wasm serve-wasm devserver run clean fmt install-tools watch
 
 lint:
 	GOOS=js GOARCH=wasm go vet ./...
@@ -26,9 +26,13 @@ devserver:
 
 install-tools:
 	go install golang.org/x/tools/cmd/goimports@latest
+	go install github.com/air-verse/air@latest
 
 fmt: install-tools
 	goimports -w .
+
+watch:
+	air
 
 clean:
 	rm -rf dist
