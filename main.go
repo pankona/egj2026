@@ -21,10 +21,27 @@ const (
 	GridWidth  = ScreenWidth / CellSize  // 80
 	GridHeight = ScreenHeight / CellSize // 60
 
-	MaxStock          = 3   // slashes available per reload cycle
-	ReloadFrames      = 120 // frames from running dry to a full MaxStock refill (2s @ 60fps)
-	SlashMinLength    = 12  // px drag threshold; a flick is enough to fire
-	SlashLength       = 320 // px; every slash is this length, regardless of drag distance
+	// Energy is quantized into MaxStock discrete units. A single drag spends
+	// 1, 2, or 3 units depending on its length (mapped via the *DragMax
+	// thresholds below) and the resulting beam length is *Length for that
+	// unit count. This gives "small-dab burst spam" and "all-in big swipe"
+	// distinct identities while keeping the connectivity-of-touch precision
+	// problem (you can't reliably drag exactly N px) bounded by the threshold
+	// hysteresis — being off by 20 px doesn't change which bucket you land in.
+	MaxStock          = 6   // total energy units the buffer can hold (single drag still spends at most 3)
+	UnitRecoverFrames = 60  // frames to regenerate one unit (1s @ 60fps); trickles continuously
+	SlashMinLength    = 12  // px; below this the drag is treated as noise (no fire, no cost)
+	ShortDragMax      = 100 // px drag; <= this lands in the 1-unit bucket
+	MidDragMax        = 200 // px drag; <= this lands in the 2-unit bucket (otherwise 3 units)
+	// The beam grows from the drag's *start* point in the drag direction
+	// (not from the midpoint). We size each bucket so the beam length is
+	// noticeably greater than the bucket's max drag distance, which keeps
+	// the beam tip out from under the finger during normal play — the only
+	// way to land the tip under the finger is to drag farther than 360 px,
+	// which is well past any natural swipe.
+	ShortLength = 130 // px beam length for a 1-unit slash (> ShortDragMax)
+	MidLength   = 240 // px beam length for a 2-unit slash (> MidDragMax)
+	LongLength  = 360 // px beam length for a 3-unit slash (tip stays visible up to ~360px drags)
 	SlashRevealFrames = 1   // frames for the beam to extend end-to-end (1 = instant snap)
 	SlashGlowFrames   = 14  // afterglow frames before the slash effect is removed
 	BladeRadius       = 0   // cells (half-thickness of the slash beam; 0 = single-cell hairline. burnSegment patches the 4-connectivity hole that single-cell diagonals would otherwise leave.)
@@ -304,7 +321,7 @@ func (g *Game) updatePlaying() {
 	// instead gives us a valid release position for fireSlash.
 	if pressed {
 		g.pointerX, g.pointerY = mx, my
-		if !g.dragging && g.stock > 0 {
+		if !g.dragging && g.stock >= 1 {
 			g.dragging = true
 			g.slashStartX, g.slashStartY = mx, my
 			g.hue += 47 + g.rng.Float64()*30
@@ -316,14 +333,16 @@ func (g *Game) updatePlaying() {
 
 	g.updateSlashes()
 
-	// Reload is all-or-nothing: it only ticks once the magazine is empty, and
-	// when the bar fills it refills all MaxStock slashes at once. Trickle
-	// refills made the dry spell feel like death by a thousand cuts; this way
-	// players know exactly when their next burst lands.
-	if g.stock == 0 {
-		g.reloadProgress += 1.0 / float64(ReloadFrames)
+	// Energy regenerates one unit at a time, continuously. Trickling like
+	// this is what makes "spend a quick 1-unit dab, then keep firing as
+	// units re-arrive" feel different from "spend a 3-unit haymaker and
+	// wait." reloadProgress is the 0..1 progress toward the *next* unit
+	// (not toward a full magazine), so the HUD shows a steadily-rising bar
+	// rather than a long all-or-nothing wait.
+	if g.stock < MaxStock {
+		g.reloadProgress += 1.0 / float64(UnitRecoverFrames)
 		if g.reloadProgress >= 1.0 {
-			g.stock = MaxStock
+			g.stock++
 			g.reloadProgress = 0
 		}
 	} else {
@@ -393,33 +412,64 @@ func (g *Game) updatePlaying() {
 	}
 }
 
-// fireSlash spawns a slash whose center sits at the midpoint of the drag and
-// whose direction matches the drag, with a fixed total length (SlashLength).
-// Drag distance only conveys "which way and where" — the beam itself is
-// always the same size, so a flick produces a shockwave equally as long as a
-// full swipe. Drags shorter than SlashMinLength are ignored (direction
-// unstable, no stock cost). Painting and claim happen in updateSlashes; this
-// only registers the strike and burns one stock.
-func (g *Game) fireSlash(x0, y0, x1, y1 int) {
-	if g.stock <= 0 {
-		return
+// slashSpec maps (drag distance, current stock) to the slash that would fire.
+// Quantizing into three buckets keeps "I meant to dab" from being misread as
+// "I meant to swing" — being off by 20 px doesn't change the result. When the
+// player asks for more units than they have, the request is downgraded to
+// whatever they can afford (so a big swipe with 1 unit left still fires, just
+// shorter). Returns ok=false when the drag is below SlashMinLength or there's
+// no energy at all to spend.
+func slashSpec(dragDist float64, stock int) (units int, length float64, ok bool) {
+	if dragDist < SlashMinLength || stock <= 0 {
+		return 0, 0, false
 	}
+	switch {
+	case dragDist < ShortDragMax:
+		units = 1
+	case dragDist < MidDragMax:
+		units = 2
+	default:
+		units = 3
+	}
+	if units > stock {
+		units = stock
+	}
+	return units, lengthForUnits(units), true
+}
+
+func lengthForUnits(u int) float64 {
+	switch u {
+	case 1:
+		return ShortLength
+	case 2:
+		return MidLength
+	case 3:
+		return LongLength
+	}
+	return 0
+}
+
+// fireSlash spawns a slash that starts at the drag's start point and extends
+// in the drag direction for the bucketed length from slashSpec. This means
+// the place the player first touched is the strike origin and the beam fans
+// out forward, which (a) reads as "swing from here" rather than "explode
+// around here", and (b) keeps the beam tip out from under the finger as long
+// as the bucket's max drag is shorter than its beam length.
+func (g *Game) fireSlash(x0, y0, x1, y1 int) {
 	dx := float64(x1 - x0)
 	dy := float64(y1 - y0)
 	dist := math.Hypot(dx, dy)
-	if dist < SlashMinLength {
+	units, length, ok := slashSpec(dist, g.stock)
+	if !ok {
 		return
 	}
 	nx := dx / dist
 	ny := dy / dist
-	midX := (float64(x0) + float64(x1)) / 2
-	midY := (float64(y0) + float64(y1)) / 2
-	half := float64(SlashLength) / 2
-	g.stock--
-	sx0 := midX - nx*half
-	sy0 := midY - ny*half
-	sx1 := midX + nx*half
-	sy1 := midY + ny*half
+	g.stock -= units
+	sx0 := float64(x0)
+	sy0 := float64(y0)
+	sx1 := sx0 + nx*length
+	sy1 := sy0 + ny*length
 	g.slashes = append(g.slashes, &Slash{
 		X0:  sx0,
 		Y0:  sy0,
@@ -1367,22 +1417,20 @@ func (g *Game) Draw(screen *ebiten.Image) {
 		}
 	}
 
-	// Active slashes: the beam fans out symmetrically from the midpoint, then
-	// fades. With SlashRevealFrames=1 the line snaps to full length on the
-	// first drawn frame; the formula still uses t so a longer Reveal would
-	// animate the two tips outward. A brief shockwave ring at the midpoint
-	// sells the "impact" of the strike.
+	// Active slashes: the beam extends from the start point toward the tip,
+	// then fades. With SlashRevealFrames=1 the line snaps to full length on
+	// the first drawn frame; the formula still uses t so a longer Reveal
+	// would animate the tip outward. A brief shockwave ring at the start
+	// point sells the "swing began here" beat of the strike.
 	for _, sl := range g.slashes {
 		t := float64(sl.Frame) / float64(SlashRevealFrames)
 		if t > 1 {
 			t = 1
 		}
-		midX := (sl.X0 + sl.X1) / 2
-		midY := (sl.Y0 + sl.Y1) / 2
-		leftX := float32(midX + (sl.X0-midX)*t)
-		leftY := float32(midY + (sl.Y0-midY)*t)
-		rightX := float32(midX + (sl.X1-midX)*t)
-		rightY := float32(midY + (sl.Y1-midY)*t)
+		startX := float32(sl.X0)
+		startY := float32(sl.Y0)
+		tipX := float32(sl.X0 + (sl.X1-sl.X0)*t)
+		tipY := float32(sl.Y0 + (sl.Y1-sl.Y0)*t)
 
 		var alpha uint8 = 240
 		width := float32(4)
@@ -1394,23 +1442,32 @@ func (g *Game) Draw(screen *ebiten.Image) {
 			alpha = uint8(220 * (1 - gp))
 			width = 4 - 2.5*float32(gp)
 		}
-		vector.StrokeLine(screen, leftX, leftY, rightX, rightY,
+		vector.StrokeLine(screen, startX, startY, tipX, tipY,
 			width, color.RGBA{255, 255, 255, alpha}, true)
 
-		// Shockwave ring: widens and fades over the first few frames.
+		// Shockwave ring at the start point: widens and fades over the
+		// first few frames.
 		if sl.Frame <= 4 {
 			r := float32(6 + sl.Frame*7)
 			a := uint8(150 - sl.Frame*30)
-			vector.StrokeCircle(screen, float32(midX), float32(midY), r, 2,
+			vector.StrokeCircle(screen, startX, startY, r, 2,
 				color.RGBA{255, 255, 255, a}, true)
 		}
 	}
 
-	// Drag preview. Shows two things simultaneously:
+	// Drag preview. The slash starts at the drag start point and extends in
+	// the drag direction for the length matched to the unit bucket. Shows
+	// three things simultaneously:
 	//   - the actual drag segment (start -> current pointer) as a small bright
 	//     line, so the player feels the strike forming under their finger;
-	//   - a faint ghost of the full slash that will fire (midpoint-centered,
-	//     symmetric, SlashLength long) so they can aim the shockwave precisely.
+	//   - a ghost of the slash that would fire right now (start-anchored,
+	//     length matched to the unit bucket the drag falls into) — its tip
+	//     pokes past the pointer for any drag within its bucket's max, so the
+	//     player can see what they're aiming;
+	//   - a start-point ring whose radius/intensity scales with the unit count
+	//     so "this is a 3-unit haymaker" reads at a glance vs "this is a
+	//     1-unit dab." The ring sits at the strike origin (= the drag's first
+	//     touch, well away from the moving fingertip) for maximum visibility.
 	if g.state == StatePlaying && g.dragging {
 		sx := float32(g.slashStartX)
 		sy := float32(g.slashStartY)
@@ -1420,26 +1477,37 @@ func (g *Game) Draw(screen *ebiten.Image) {
 		dyp := float64(py - sy)
 		dist := math.Hypot(dxp, dyp)
 
-		if dist >= SlashMinLength {
+		if units, length, ok := slashSpec(dist, g.stock); ok {
 			nx := dxp / dist
 			ny := dyp / dist
-			mx := (float64(sx) + float64(px)) / 2
-			my := (float64(sy) + float64(py)) / 2
-			half := float64(SlashLength) / 2
-			gx0 := float32(mx - nx*half)
-			gy0 := float32(my - ny*half)
-			gx1 := float32(mx + nx*half)
-			gy1 := float32(my + ny*half)
-			vector.StrokeLine(screen, gx0, gy0, gx1, gy1, 1,
-				color.RGBA{255, 255, 255, 70}, true)
+			gx1 := sx + float32(nx*length)
+			gy1 := sy + float32(ny*length)
+
+			var ghostWidth float32
+			var ghostAlpha uint8
+			var ringR float32
+			switch units {
+			case 1:
+				ghostWidth, ghostAlpha, ringR = 1.0, 90, 4
+			case 2:
+				ghostWidth, ghostAlpha, ringR = 1.8, 140, 7
+			case 3:
+				ghostWidth, ghostAlpha, ringR = 2.6, 210, 11
+			}
+			vector.StrokeLine(screen, sx, sy, gx1, gy1, ghostWidth,
+				color.RGBA{255, 255, 255, ghostAlpha}, true)
+			vector.StrokeCircle(screen, sx, sy, ringR, 1.5,
+				color.RGBA{255, 255, 255, ghostAlpha}, true)
 		}
 		vector.StrokeLine(screen, sx, sy, px, py, 2.5,
 			color.RGBA{255, 255, 255, 220}, true)
 		vector.DrawFilledCircle(screen, sx, sy, 3, color.RGBA{255, 255, 255, 230}, true)
 	}
 
-	// Stock pips + reload progress bar. Filled pip = ready to slash;
-	// hollow pip = waiting on reload.
+	// Energy pips + trickle progress bar. Filled pip = unit ready to spend;
+	// hollow pip = not yet regenerated. The bar shows progress toward the
+	// *next* unit (not toward a full magazine), so it's always animating
+	// while the player isn't capped — a steady visible drumbeat of recharge.
 	pipY := float32(14)
 	pipR := float32(5)
 	pipGap := float32(16)
@@ -1453,7 +1521,7 @@ func (g *Game) Draw(screen *ebiten.Image) {
 				color.RGBA{120, 140, 160, 220}, true)
 		}
 	}
-	if g.stock == 0 {
+	if g.stock < MaxStock {
 		barX := 14 + float32(MaxStock)*pipGap + 4
 		barY := pipY - 3
 		barW := float32(60)
@@ -1475,7 +1543,7 @@ func (g *Game) Draw(screen *ebiten.Image) {
 	switch g.state {
 	case StateTitle:
 		drawCenter(screen, "R I F T", ScreenHeight/2-40)
-		drawCenter(screen, "Drag a straight slash. 3 strikes per reload.", ScreenHeight/2-10)
+		drawCenter(screen, "Drag a straight slash. Short drag = short beam, long drag = long beam.", ScreenHeight/2-10)
 		drawCenter(screen, "Encircle the dark to seal every foe before time runs out.", ScreenHeight/2+4)
 		drawCenter(screen, "[Click or Space to start]", ScreenHeight/2+34)
 	case StateCleared:
