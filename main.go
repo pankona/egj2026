@@ -27,7 +27,8 @@ const (
 	SlashLength       = 320 // px; every slash is this length, regardless of drag distance
 	SlashRevealFrames = 1   // frames for the beam to extend end-to-end (1 = instant snap)
 	SlashGlowFrames   = 14  // afterglow frames before the slash effect is removed
-	BladeRadius       = 2   // cells (half-thickness of the slash beam)
+	BladeRadius       = 0   // cells (half-thickness of the slash beam; 0 = single-cell hairline. burnSegment patches the 4-connectivity hole that single-cell diagonals would otherwise leave.)
+	SlashHitRadius    = 2   // cells (anchored-enemy hit half-width; kept thicker than BladeRadius so a thin beam still feels generous to land)
 
 	LightThresholdCount = 0.35 // cells with light above this counted as bright
 	WallLightThreshold  = 0.5  // cells brighter than this block flood fill
@@ -433,7 +434,7 @@ func (g *Game) fireSlash(x0, y0, x1, y1 int) {
 	// gated on isAnchoring so during normal patrol the slash still only
 	// affects light, not enemies.
 	if g.isAnchoring() {
-		bladePx := float64(BladeRadius * CellSize)
+		bladePx := float64(SlashHitRadius * CellSize)
 		survivors := g.enemies[:0]
 		for _, e := range g.enemies {
 			if !e.IsBoss && pointSegmentDistance(e.X, e.Y, sx0, sy0, sx1, sy1) <= e.Radius+bladePx {
@@ -488,6 +489,13 @@ func (g *Game) updateSlashes() {
 // burnSegment illuminates the portion of slash s between parametric points
 // t0 and t1 (0=anchor, 1=tip). Temporarily borrows the global hue so the
 // existing illuminate() routine paints in this slash's color.
+//
+// With BladeRadius=0 the painted footprint is a single cell, so a 45° slash
+// can step from cell (a,a) to (a+1,a+1) in one ~1px sample — that diagonal
+// jump leaves the line 8-connected but not 4-connected, and claimEnclosure's
+// 4-connected flood would leak through the gap. We track the previous cell
+// and, whenever both coordinates change in one step, also paint one of the
+// two intermediates so the wall stays 4-connected for any BladeRadius.
 func (g *Game) burnSegment(s *Slash, t0, t1 float64) {
 	if t1 <= t0 {
 		return
@@ -498,11 +506,22 @@ func (g *Game) burnSegment(s *Slash, t0, t1 float64) {
 	steps := int(segLen) + 1
 	saved := g.hue
 	g.hue = s.Hue
+	var prevCX, prevCY int
+	havePrev := false
 	for i := 0; i <= steps; i++ {
 		u := t0 + (t1-t0)*float64(i)/float64(steps)
 		px := int(s.X0 + dx*u)
 		py := int(s.Y0 + dy*u)
+		cx := px / CellSize
+		cy := py / CellSize
+		if havePrev && cx != prevCX && cy != prevCY {
+			// Diagonal jump — patch one orthogonal neighbour at this cell's
+			// center to preserve 4-connectivity.
+			g.illuminate(prevCX*CellSize+CellSize/2, cy*CellSize+CellSize/2)
+		}
 		g.illuminate(px, py)
+		prevCX, prevCY = cx, cy
+		havePrev = true
 	}
 	g.hue = saved
 }
