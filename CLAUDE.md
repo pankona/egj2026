@@ -9,7 +9,7 @@ Ebitengine Game Jam 2026 への参加作品。テーマは **DISCONNECT（切断
 
 - 解像度: 640x480、セル 8px の 80x60 グリッド (`CellSize`, `GridWidth`, `GridHeight`)
 - 入力: マウスドラッグ／タッチドラッグ（タッチ優先、`pointerPos` 参照）。フリックでも発動するよう、確定に必要なドラッグ距離は `SlashMinLength` だけ
-- 斬撃 (`fireSlash` → `updateSlashes` → `burnSegment` → `illuminate`): ドラッグ開始点を起点に、ドラッグ方向へ可変長 (`ShortLength` / `MidLength` / `LongLength`) で伸びる。長さは `slashSpec` がドラッグ距離を `ShortDragMax` / `MidDragMax` の 2 段で量子化して決め、同時に 1 / 2 / 3 ユニットの energy を消費する。バケット内のドラッグ距離上限は対応する beam length より短く設定してあるので、ビーム先端が指の少し前にはみ出して見える (= 指で線が隠れない)。`SlashRevealFrames` で全長まで展開し、`SlashGlowFrames` で残光が消える。塗り半径は `BladeRadius` セル（`0` で 1 セル幅のヘアライン。包囲した内側 claim を主役にするための極細）、anchored enemy の被弾半径だけ別定数 `SlashHitRadius` セルで太めに保持。`burnSegment` が直前セルとの対角ジャンプを検知して片側 1 セルを補完するので、半径 0 でも 4-連結が切れず `claimEnclosure` が成立する。アクティブな斬撃は `Game.slashes []*Slash` で管理し、毎フレーム tip が進んだ分だけ grid に焼く
+- 斬撃 (`fireSlash` → `updateSlashes` → `burnSegment` → `illuminate`): ドラッグ開始点を起点に、ドラッグ方向へ可変長 (`ShortLength` / `MidLength` / `LongLength`) で伸びる。長さは `slashSpec` がドラッグ距離を `ShortDragMax` / `MidDragMax` の 2 段で量子化して決め、同時に 1 / 2 / 3 ユニットの energy を消費する。バケット内のドラッグ距離上限は対応する beam length より短く設定してあるので、ビーム先端が指の少し前にはみ出して見える (= 指で線が隠れない)。`SlashRevealFrames` で全長まで展開し、`SlashGlowFrames` で残光が消える。塗り半径は `BladeRadius` セル（`0` で 1 セル幅のヘアライン。包囲した内側 claim を主役にするための極細）、anchored enemy の被弾半径だけ別定数 `SlashHitRadius` セルで太めに保持。`burnSegment` が直前セルとの対角ジャンプを検知すると、両側の orthogonal neighbor 2 セルを補完して 2x2 ブロックを描く。これで 4-連結が切れない (`claimEnclosure` が成立する) のと同時に、ヘアラインでも視覚的に「途切れない太線」に見える (片側 1 セルだけだと L 字キンクが連続して目には「線が切れている」ように映る)。アクティブな斬撃は `Game.slashes []*Slash` で管理し、毎フレーム tip が進んだ分だけ grid に焼く
 - 領域確定 (`claimEnclosure`): 斬撃が全長まで伸びた瞬間にプレイフィールド (常時壁の外周 1 セル内側) を 4-連結の暗領域に分解。**画面端に接する成分は「外側」扱いで除外し、完全に閉じた領域だけを claim** する。縦 2 本などの「画面を分割するだけ」のストロークは何も取れず、3 本以上で多角形を組まないと光化されない。内部の敵は claim と同時に除去
 - 侵食 (`erodeAround`): 敵のまわりの光セルを暗くする。光の縁 (`WallLightThreshold` 未満の隣接セルを持つセル) は `EnemyEdgeBoost` 倍で削れる。`EffectRadius = 0` の敵（チュートリアル用）は呼ばれても無効
 - 結界 (`advanceBindPhase` → `bindEdgesNow` → `bindEnclosure`): `EnableBind` ステージでは全敵共通タイマー `bindPhase` が Roaming → Warning → Holding を周回。Holding 終了フレームで、静止中の敵ペアを暗線として描いた壁集合と既存の暗領域を合算し、明領域を連結成分に分解 → 画面端に接しない閉領域を暗化する。プレイヤー側 claim の鏡写し
@@ -28,6 +28,8 @@ Makefile                 build / build-wasm / serve-wasm / devserver / fmt / rel
 ```
 
 `Stage` テーブル (`stages`) で `Enemies / EnemySpeed / TimeLimit / Boss / EnableBind / HarmlessEnemy` を 1 行ずつ並べて難易度を作る。新規ステージ追加・調整はここを編集する。`EnableBind` を立てると結界フェーズが解禁され、`HarmlessEnemy` を立てると `EffectRadius=0` の侵食しない敵が生える（ステージ 1 のチュートリアル用）。
+
+ステージ 1〜3 はオンボーディング階段として 1 軸ずつ要素を増やす設計: ステージ 1 = 1 体 / `EnemySpeed=0` / 動かない / 侵食しない (ENCLOSE するだけ)、ステージ 2 = 2 体 / `EnemySpeed=0` / 動かない / **侵食する** (時間プレッシャー初体験)、ステージ 3 = 2 体 / `EnemySpeed=0.40` / **動く** / 侵食する。ステージ 4 で結界 (`EnableBind: true`) 解禁。要素を 1 つずつ足すことで、ゲームオーバーした時に「何が原因だったか」を切り分けて学べる。
 
 `GameState` (`StateTitle / StatePlaying / StateCleared / StateGameOver / StateAllCleared`) の遷移は `Update` のスイッチで一元管理。クリア／ゲームオーバー時の `postClearCooldown` は次入力を受ける前のクッション。勝利条件は全ステージ共通で **`len(g.enemies) == 0`** の一本道。
 
@@ -88,7 +90,7 @@ make fmt            goimports -w .
 - **claim は完全閉領域だけ**: 当初は「画面端から flood-fill して外側を確定 → 残りを claim」だったが、画面端を「常時壁」にしたら起点エリア = 内側全域につながって claim できなくなった。次に「暗領域を連結成分に分解 → 最大成分を外側 → 残りを claim」に変えたが、これだと縦 2 本引いただけで両端の細長い 2 領域が claim されて 50% 以上塗れてしまうチート気味のムーブが成立した。現行は **「画面端の内周 1 セルに接する成分は『外側』扱いで除外、画面端と縁を共有しない完全閉領域だけ claim する」**。直線 3 本で三角形を組む儀式が claim 成立の最小単位になっている
 - **画面端は常時の壁**: 最外周 1 セルを「あらかじめ引いてある線」として扱い、Draw 側で 1 セル幅のフレームを描画。`claimEnclosure` の連結成分判定は内周 1 セルに接した時点で「外側」と判定する。画面端と斬撃を組み合わせて細長い領域を切り出しても、それは画面端に接しているので claim 対象外
 - **ドラッグ予告は三層 + unit ステップ表示**: ドラッグ中は (a) 始点〜現在ポインタの短い実線 (指先に追従する手触り)、(b) 始点から発射方向に length 分伸びる薄いゴースト線、(c) 始点に置かれた予告リング — を重ねて描画する。(b)(c) の線幅・アルファ・リング半径は `slashSpec` が返す unit 数 (1/2/3) で 3 段階に「圧」を増し、リリース前に「いま離すと何が出るか」が一目で分かる
-- **線は細く、包囲が主役**: 当初 `BladeRadius = 2` (幅 32px) は斬撃 1 本で画面の 3.3% を即点灯させ、3 本引くだけで線の面積だけで約 10% が光化していた。これだと「囲って中身を取る」リワード感が薄れ、包囲を成立させずにライト % を稼ぐ立ち回りが許容されてしまう。`BladeRadius = 0`（中心 1 セル = 8px 幅のヘアライン）まで下げて「線そのものは細く、囲った中身が大きな報酬」という構図に体験を寄せた。素朴に半径 0 にすると斜め斬撃で 1px サンプリングが (a,a)→(a+1,a+1) と対角ジャンプし 4-連結が切れて claim が成立しない罠があるので、`burnSegment` 側で前回セルと比較して片側 1 セルを補完するロジックを入れて回避している。被弾判定だけ `SlashHitRadius` セルで太く保ち、結界の頂点を斬る手応えは維持
+- **線は細く、包囲が主役**: 当初 `BladeRadius = 2` (幅 32px) は斬撃 1 本で画面の 3.3% を即点灯させ、3 本引くだけで線の面積だけで約 10% が光化していた。これだと「囲って中身を取る」リワード感が薄れ、包囲を成立させずにライト % を稼ぐ立ち回りが許容されてしまう。`BladeRadius = 0`（中心 1 セル = 8px 幅のヘアライン）まで下げて「線そのものは細く、囲った中身が大きな報酬」という構図に体験を寄せた。素朴に半径 0 にすると斜め斬撃で 1px サンプリングが (a,a)→(a+1,a+1) と対角ジャンプし 4-連結が切れて claim が成立しない罠があるので、`burnSegment` 側で前回セルと比較して対角ジャンプを検知 → 両側の orthogonal neighbor 2 セルを塗って 2x2 ブロックにする。当初は片側 1 セルだけ補完していたが、それだと L 字キンクが連続してプレイヤーには「線が途切れている」と見えてしまったため、両側補完に切り替えた (claim 領域への影響は内側 1 セル程度で無視できる)。被弾判定だけ `SlashHitRadius` セルで太く保ち、結界の頂点を斬る手応えは維持
 
 将来「画面が物理的に裂ける」「闇のかけらが破片化して落ちる」などの別アイデアは別軸として保留中。まずはこの衝撃波体験の調整 (`ShortLength` / `MidLength` / `LongLength` の長さ、`UnitRecoverFrames` の回復テンポ、`ShortDragMax` / `MidDragMax` の量子化しきい値、ステージごとのユニット数) を優先する。
 
@@ -106,9 +108,20 @@ make fmt            goimports -w .
 
 初期は「光カバー率しきい値 (`WinThreshold`) を制限時間内に達成」が勝利条件だったが、ボスステージだけ別ロジック (`len(g.enemies) == 0`) が走っていて分岐が二重に走っていた。プレイヤー視点でも「カバー率を満たして勝ちが確定したのに、敵がまだ画面に残っている」状態が起きて、消化試合のような違和感が出ていた。
 
-判定を一本化して「敵全滅でクリア」に統一。`Stage.WinThreshold` フィールドも削除。ステージ 1 は敵 0 では成立しないので、`HarmlessEnemy: true` の極低速（`EnemySpeed=0.20`）・`EffectRadius=0`（侵食しない）の 1 体に置き換え、「斬撃を引いて閉領域で claim する」基本ループを 30 秒で学ばせるチュートリアルに。光カバー率は HUD の進捗メータ（`Light xx%`）として残してあるが、勝敗には関わらない。
+判定を一本化して「敵全滅でクリア」に統一。`Stage.WinThreshold` フィールドも削除。ステージ 1 は敵 0 では成立しないので、`HarmlessEnemy: true` の **完全静止** (`EnemySpeed=0`)・`EffectRadius=0`（侵食しない）の 1 体に置き換え、「斬撃を引いて閉領域で claim する」基本ループを 30 秒で学ばせるチュートリアルに。`loadStage` 内でステージ 1 だけ敵を画面中央 (320, 240) 固定スポーンし、`fireSlash` での最初の発射時に `repositionTutorialFoeAwayFrom` が呼ばれてビーム中点から **垂直方向に 90px オフセットした位置にテレポート**する（最初のスラッシュ直後はまだ light が広がっていないので、移動はプレイヤーから視認されない）。これで「最初の 1 本が敵を貫いて見えなくなる」事故が構造的に消える。光カバー率は HUD の進捗メータ（`Light xx%`）として残してあるが、勝敗には関わらない。
 
 敵を倒す手段は (a) `claimEnclosure` で完全閉領域を作って中の敵を除去、(b) 結界の Anchoring 中に斬撃で頂点を撃破、の 2 ルート。Roaming 中の敵は斬撃で倒せないため、結界フェーズが「攻めのチャンス」になるリズムを意図的に作っている。
+
+## 設計メモ: なぜオンボーディングと文字描画をこう作ったか
+
+ゲームジャム提出版でテストプレイヤーから「開始直後に何をしたらいいか分からない」という声が複数挙がっていた。原因を分解すると、(1) タイトル画面の英文 2 行は読み飛ばされやすい、(2) 開始時のステージ 1 は完全暗闇で `totalLight=0` の敵が描画スキップされ「画面に何もない」状態になる、(3) HUD と全状態遷移メッセージが `ebitenutil.DebugPrintAt` の固定幅 ASCII ビットマップで読みにくい、の 3 つだった。以下の判断で対応している。
+
+- **`text/v2` + 同梱フォント**: 文字描画を `github.com/hajimehoshi/ebiten/v2/text/v2` + `examples/resources/fonts.MPlus1pRegular_ttf` に差し替え。外部アセットを足さずに済む (`go mod tidy` で `golang.org/x/image` 系が間接依存に入るだけ)。3 サイズ (`faceLarge` 32 / `faceMid` 16 / `faceSmall` 12) を `Game` に保持し、`drawCenter` / `drawCenterFace` / `drawAt` の 3 ヘルパーで使い分け。**`text.DrawOptions.ColorScale.ScaleWithColor` は色を premultiplied alpha として扱う** ため `color.RGBA{R, G, B, A<255}` を渡すとグリフが滲んで隣文字と被って見える。フェードする SEALED! やデフォルト dim 色は必ず `color.NRGBA` で渡すこと
+- **タイトル画面は 3 行に圧縮**: 旧版の長文 2 行 (`Drag a straight slash. ...` / `Encircle the dark...`) を捨て、`RIFT` / `DRAG. SLASH. ENCLOSE. SEAL.` / `Click / Space` の 3 行に。4 拍の動詞リズムでゲームの動詞を宣言する形にして、読まなくても語感で意味が伝わるようにしている (国際的なジャムなので日本語化はせず、英単語を最小限に絞る方針)
+- **ステージ 1 インラインチュートリアル**: 画面下中央に単語 1 個のヒントを表示。進行を **ドラッグ回数ではなく game event でガード**: ステップ 0 = `DRAG` / 開始時 → 最初の `fireSlash` 成功で 1 へ、ステップ 1 = `ENCLOSE` / claim 成立 (`claimEnclosure` が敵を 1 体以上消した) で 2 へ。なぜ stroke 数ベースにしないか: 3 本引いても閉領域が画面端に接していたり線が交差していなかったりで claim 不成立になる場合があり、「`1 MORE` の次で何も起きない」状態になると詰む。event ベースなら、囲めるまで `ENCLOSE` が残り続けて誘導が破綻しない
+- **ステージ 1 の敵を最初のスラッシュの真横にテレポート**: 上の「設計メモ: なぜ勝利条件を全滅に揃えたか」参照。`repositionTutorialFoeAwayFrom` がビームの perpendicular に 90px (片側で安全マージン 60px 内に収まる方を選ぶ、両方 OK なら画面中央に近い方) 移動させる。最初のスラッシュ後の light が広がる前 = 同一フレーム内で実行するので、テレポート自体は見えない
+- **HUD は数字に語らせる**: ラベル全削除、`STAGE 1 / 10` → `1 / 10` (左上 `faceMid`)、`FOES 3` → `3` (中央 `faceLarge`、勝利条件の数字を最大強調)、`30.0s` (右上 `faceMid`)、`35%` (左下 `faceSmall`、補助情報)。`Foes` 数字を最大にすることで「これを 0 にすれば勝ち」が一目で伝わる
+- **`SEALED!` フラッシュ + StatePlaying ゲート**: `claimEnclosure` が敵を 1 体以上消したフレームで `sealedFlashFrames = 30` をセット、`Update` 内で減算してフェードさせる。**`g.state == StatePlaying` でガード必須**: 最後の 1 体を倒した瞬間は同フレーム内で sealedFlashFrames セット + `len(enemies)==0` 判定 → `StateCleared` 遷移が起きる。次フレーム以降 `updatePlaying` が呼ばれないので sealedFlashFrames は固定値のまま残り、StateCleared の CLEAR メッセージと同じ y 座標 (`ScreenHeight/2-20`) に重ね描きされて「複数の文字が重なって見える」事故になる。StatePlaying ガードで「クリア時は CLEAR だけ」「中盤で敵を封じた時だけ SEALED!」が自然に成立する
 
 ## 設計メモ: なぜ敵を球面ランバートで描くか
 
@@ -160,3 +173,4 @@ SlashGlowFrames    = 14    // 残光フレーム数
 - **回復ペース**: フル消費 → フル充填 6 秒が長すぎたら `UnitRecoverFrames = 45` に。逆に「常に満タン気味で攻め放題」なら 75〜90 に締める
 - **6 ピップ HUD の密度**: `pipGap = 16` のままで 6 個並ぶと x=14〜94。Stage 行 (y=24) とは被らないが、横長になる。詰めたい場合は `pipGap` を 12〜14 に
 - **新しい線長で claim 成立する最小ポリゴン**: `ShortLength = 130` の三角形は内側面積がかなり小さい。「小撃ち 3 連射で素早く小さい三角を取る」が機能するかは要確認
+- **ステージ 2 のランダム配置と最初のスラッシュ被り**: ステージ 2 は 2 体ランダム配置で `repositionTutorialFoeAwayFrom` 対象外。最初のドラッグが敵を貫いて見えにくくなる事故が起きる可能性あり。気になるなら `g.currentStage == 0` のガードを `<= 1` に広げて 2 体それぞれを近傍候補に再配置する手がある
