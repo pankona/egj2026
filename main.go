@@ -601,8 +601,11 @@ func (g *Game) updateSlashes() {
 // can step from cell (a,a) to (a+1,a+1) in one ~1px sample — that diagonal
 // jump leaves the line 8-connected but not 4-connected, and claimEnclosure's
 // 4-connected flood would leak through the gap. We track the previous cell
-// and, whenever both coordinates change in one step, also paint one of the
-// two intermediates so the wall stays 4-connected for any BladeRadius.
+// and, whenever both coordinates change in one step, paint BOTH orthogonal
+// intermediates. One alone (L-shape) keeps the flood safe but looks like a
+// zig-zag staircase to the eye — readers report it as "the line is broken."
+// Painting both gives every diagonal step a 2x2 block, which reads as a
+// continuous thick line without changing the claim geometry meaningfully.
 func (g *Game) burnSegment(s *Slash, t0, t1 float64) {
 	if t1 <= t0 {
 		return
@@ -622,9 +625,10 @@ func (g *Game) burnSegment(s *Slash, t0, t1 float64) {
 		cx := px / CellSize
 		cy := py / CellSize
 		if havePrev && cx != prevCX && cy != prevCY {
-			// Diagonal jump — patch one orthogonal neighbour at this cell's
-			// center to preserve 4-connectivity.
+			// Diagonal jump — fill both orthogonal neighbours so the
+			// step closes into a 2x2 block instead of an L kink.
 			g.illuminate(prevCX*CellSize+CellSize/2, cy*CellSize+CellSize/2)
+			g.illuminate(cx*CellSize+CellSize/2, prevCY*CellSize+CellSize/2)
 		}
 		g.illuminate(px, py)
 		prevCX, prevCY = cx, cy
