@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"image/color"
 	"log"
@@ -9,7 +10,9 @@ import (
 
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/ebitenutil"
+	"github.com/hajimehoshi/ebiten/v2/examples/resources/fonts"
 	"github.com/hajimehoshi/ebiten/v2/inpututil"
+	"github.com/hajimehoshi/ebiten/v2/text/v2"
 	"github.com/hajimehoshi/ebiten/v2/vector"
 )
 
@@ -84,9 +87,9 @@ type Stage struct {
 }
 
 var stages = []Stage{
-	{Enemies: 1, EnemySpeed: 0.20, TimeLimit: 30, HarmlessEnemy: true},   // 1 tutorial: one slow harmless target
-	{Enemies: 1, EnemySpeed: 0.40, TimeLimit: 45},                        // 2
-	{Enemies: 2, EnemySpeed: 0.40, TimeLimit: 45},                        // 3
+	{Enemies: 1, EnemySpeed: 0, TimeLimit: 30, HarmlessEnemy: true},      // 1 tutorial: one stationary harmless target parked dead center (see loadStage)
+	{Enemies: 2, EnemySpeed: 0, TimeLimit: 45},                           // 2 two stationary foes that DO erode — first taste of time pressure
+	{Enemies: 2, EnemySpeed: 0.40, TimeLimit: 45},                        // 3 enemies start moving
 	{Enemies: 2, EnemySpeed: 0.55, TimeLimit: 55, EnableBind: true},      // 4 bind intro
 	{Enemies: 3, EnemySpeed: 0.55, TimeLimit: 55, EnableBind: true},      // 5
 	{Enemies: 3, EnemySpeed: 0.70, TimeLimit: 60, EnableBind: true},      // 6
@@ -177,14 +180,40 @@ type Game struct {
 	bindPhase       int
 	bindPhaseFrames int
 	severedPairs    map[[2]int]bool
+
+	// Onboarding state. tutorialStep is gated on game events, not stroke
+	// count, because three slashes don't always form a sealable enclosure
+	// (parallel lines, lines that only touch the border, etc.). Step 0:
+	// before any slash. Step 1: at least one slash fired, waiting on a
+	// successful claim. Step 2 onward: hint suppressed.
+	// sealedFlashFrames counts down a brief SEALED! center flash whenever
+	// claimEnclosure removes one or more enemies, so the player feels the
+	// causal link between the closing slash and the kill.
+	tutorialStep      int
+	sealedFlashFrames int
+
+	// Fonts are shared by every drawing path. faceLarge is reserved for
+	// hero text (title, big mid-screen flashes); faceMid for HUD primary
+	// numbers and tutorial hints; faceSmall for footnotes and reload-state
+	// callouts.
+	faceLarge *text.GoTextFace
+	faceMid   *text.GoTextFace
+	faceSmall *text.GoTextFace
 }
 
 func newGame() *Game {
+	src, err := text.NewGoTextFaceSource(bytes.NewReader(fonts.MPlus1pRegular_ttf))
+	if err != nil {
+		log.Fatal(err)
+	}
 	g := &Game{
-		state:  StateTitle,
-		stock:  MaxStock,
-		rng:    rand.New(rand.NewSource(20260622)),
-		pixels: make([]byte, GridWidth*GridHeight*4),
+		state:     StateTitle,
+		stock:     MaxStock,
+		rng:       rand.New(rand.NewSource(20260622)),
+		pixels:    make([]byte, GridWidth*GridHeight*4),
+		faceLarge: &text.GoTextFace{Source: src, Size: 32},
+		faceMid:   &text.GoTextFace{Source: src, Size: 16},
+		faceSmall: &text.GoTextFace{Source: src, Size: 12},
 	}
 	g.loadStage(0)
 	return g
@@ -221,6 +250,8 @@ func (g *Game) loadStage(idx int) {
 	g.bindPhase = 0
 	g.bindPhaseFrames = 0
 	g.severedPairs = map[[2]int]bool{}
+	g.tutorialStep = 0
+	g.sealedFlashFrames = 0
 	if s.Boss {
 		g.enemies = append(g.enemies, &Enemy{
 			X:            ScreenWidth / 2,
@@ -239,10 +270,21 @@ func (g *Game) loadStage(idx int) {
 		effectR = 0
 	}
 	for i := 0; i < s.Enemies; i++ {
+		// Stage 1 (tutorial) parks its lone foe dead center so the
+		// "ENCLOSE" target is unambiguous and stationary. EnemySpeed
+		// is 0 for that stage, so the random initial velocity below
+		// resolves to zero and the steerer can't push it either.
+		var ex, ey float64
+		if idx == 0 {
+			ex, ey = ScreenWidth/2, ScreenHeight/2
+		} else {
+			ex = g.rng.Float64()*float64(ScreenWidth-160) + 80
+			ey = g.rng.Float64()*float64(ScreenHeight-160) + 80
+		}
 		g.enemies = append(g.enemies, &Enemy{
 			ID:           i + 1,
-			X:            g.rng.Float64()*float64(ScreenWidth-160) + 80,
-			Y:            g.rng.Float64()*float64(ScreenHeight-160) + 80,
+			X:            ex,
+			Y:            ey,
 			VX:           (g.rng.Float64()*2 - 1) * s.EnemySpeed,
 			VY:           (g.rng.Float64()*2 - 1) * s.EnemySpeed,
 			Speed:        s.EnemySpeed,
@@ -386,6 +428,10 @@ func (g *Game) updatePlaying() {
 	// reflected immediately.
 	g.reviewClaims()
 
+	if g.sealedFlashFrames > 0 {
+		g.sealedFlashFrames--
+	}
+
 	g.stageTime -= 1.0 / 60.0
 	if g.stageTime <= 0 {
 		g.state = StateGameOver
@@ -470,6 +516,17 @@ func (g *Game) fireSlash(x0, y0, x1, y1 int) {
 	sy0 := float64(y0)
 	sx1 := sx0 + nx*length
 	sy1 := sy0 + ny*length
+	if g.currentStage == 0 && g.tutorialStep == 0 {
+		// First slash fired: advance to "ENCLOSE" prompt. Further advances
+		// happen when claimEnclosure actually seals a pocket, not on stroke
+		// count — three strokes don't guarantee a sealable shape.
+		g.tutorialStep = 1
+		// Re-park the tutorial foe at the candidate cell that sits farthest
+		// from this beam, so the player's first stroke never crosses where
+		// the enemy ends up. Center is included in the candidate set, so
+		// the foe only moves if the beam actually came near it.
+		g.repositionTutorialFoeAwayFrom(sx0, sy0, sx1, sy1)
+	}
 	g.slashes = append(g.slashes, &Slash{
 		X0:  sx0,
 		Y0:  sy0,
@@ -835,6 +892,7 @@ func (g *Game) claimEnclosure() {
 		}
 		return false
 	}
+	before := len(g.enemies)
 	survivors := g.enemies[:0]
 	for _, e := range g.enemies {
 		cx := int(e.X) / CellSize
@@ -845,6 +903,17 @@ func (g *Game) claimEnclosure() {
 		survivors = append(survivors, e)
 	}
 	g.enemies = survivors
+	if len(g.enemies) < before {
+		// Frame budget for the SEALED! flash. 30 frames at 60fps is half a
+		// second — long enough to register, short enough that the next
+		// strike doesn't have to wait for it to clear.
+		g.sealedFlashFrames = 30
+		// First successful seal also retires the stage-1 ENCLOSE hint —
+		// the player has demonstrated the full loop.
+		if g.currentStage == 0 && g.tutorialStep < 2 {
+			g.tutorialStep = 2
+		}
+	}
 }
 
 // reviewClaims re-evaluates every claimed pocket against the current grid
@@ -1152,6 +1221,69 @@ func (g *Game) rasterizeBindLine(x0, y0, x1, y1 float64, dark *[GridWidth][GridH
 			}
 		}
 	}
+}
+
+// repositionTutorialFoeAwayFrom moves the stage-1 foe to a slot right
+// alongside the first beam — close enough that the player can clearly
+// see "I drew that, the foe sat down next to it" but offset on the
+// perpendicular so the beam itself doesn't hide it. Called the frame
+// the first slash flies, before any lighting reaches the foe, so the
+// teleport itself is invisible. The two perpendicular candidates (one
+// on each side of the beam) are compared; the one that fits safely
+// inside the playfield is preferred, and final clamp keeps the foe
+// from sliding off-screen if the beam ran along an edge.
+func (g *Game) repositionTutorialFoeAwayFrom(x0, y0, x1, y1 float64) {
+	if len(g.enemies) == 0 {
+		return
+	}
+	const offset = 90.0 // px from the beam line — close enough to feel grouped
+	const margin = 60.0 // px playfield safe area for the foe center
+	midX := (x0 + x1) / 2
+	midY := (y0 + y1) / 2
+	length := math.Hypot(x1-x0, y1-y0)
+	if length < 1 {
+		return
+	}
+	perpX := -(y1 - y0) / length
+	perpY := (x1 - x0) / length
+	candA := [2]float64{midX + perpX*offset, midY + perpY*offset}
+	candB := [2]float64{midX - perpX*offset, midY - perpY*offset}
+	inSafe := func(p [2]float64) bool {
+		return p[0] >= margin && p[0] <= ScreenWidth-margin &&
+			p[1] >= margin && p[1] <= ScreenHeight-margin
+	}
+	var chosen [2]float64
+	switch {
+	case inSafe(candA) && !inSafe(candB):
+		chosen = candA
+	case inSafe(candB) && !inSafe(candA):
+		chosen = candB
+	default:
+		// Both fit (or neither): take the one closer to the screen
+		// center so the foe stays in the natural focal area.
+		cx, cy := float64(ScreenWidth)/2, float64(ScreenHeight)/2
+		dA := math.Hypot(candA[0]-cx, candA[1]-cy)
+		dB := math.Hypot(candB[0]-cx, candB[1]-cy)
+		if dA <= dB {
+			chosen = candA
+		} else {
+			chosen = candB
+		}
+	}
+	if chosen[0] < margin {
+		chosen[0] = margin
+	}
+	if chosen[0] > ScreenWidth-margin {
+		chosen[0] = ScreenWidth - margin
+	}
+	if chosen[1] < margin {
+		chosen[1] = margin
+	}
+	if chosen[1] > ScreenHeight-margin {
+		chosen[1] = ScreenHeight - margin
+	}
+	e := g.enemies[0]
+	e.X, e.Y = chosen[0], chosen[1]
 }
 
 // pointSegmentDistance is the shortest distance from (px,py) to the segment
@@ -1531,43 +1663,107 @@ func (g *Game) Draw(screen *ebiten.Image) {
 			color.RGBA{200, 230, 255, 200}, false)
 	}
 
-	msg := fmt.Sprintf("Stage %d/%d   Light %3.0f%%   Foes %d   Time %4.1fs",
-		g.currentStage+1, len(stages), g.lightPercent*100, len(g.enemies), g.stageTime)
-	ebitenutil.DebugPrintAt(screen, msg, 10, 24)
+	// NRGBA for text colors: text/v2's glyph alpha compositing breaks down
+	// when the source color violates premultiplied-alpha invariants. RGBA is
+	// fine when alpha is 255, but as soon as we want a translucent dim or a
+	// fade, premultiplied math produces visible glyph artifacts.
+	white := color.NRGBA{240, 245, 255, 255}
+	dim := color.NRGBA{170, 185, 210, 230}
+	gold := color.NRGBA{255, 220, 130, 255}
+
+	// HUD: numbers carry the meaning, labels stay out of the way. Foes is
+	// the win-condition counter so it gets the big face and the screen
+	// center. Stage anchors top-left as "N/M"; time anchors top-right.
+	// Light percent is a faint footer so it doesn't compete with foes.
+	g.drawAt(screen, fmt.Sprintf("%d / %d", g.currentStage+1, len(stages)), 10, 36, g.faceMid, dim)
+	foesMsg := fmt.Sprintf("%d", len(g.enemies))
+	foesW, _ := text.Measure(foesMsg, g.faceLarge, 0)
+	g.drawAt(screen, foesMsg, ScreenWidth/2-int(foesW)/2, 18, g.faceLarge, white)
+	timeMsg := fmt.Sprintf("%4.1fs", g.stageTime)
+	timeW, _ := text.Measure(timeMsg, g.faceMid, 0)
+	g.drawAt(screen, timeMsg, ScreenWidth-10-int(timeW), 36, g.faceMid, white)
+	g.drawAt(screen, fmt.Sprintf("%3.0f%%", g.lightPercent*100), 10, ScreenHeight-22, g.faceSmall, dim)
 
 	if DebugMode {
 		ebitenutil.DebugPrintAt(screen,
-			fmt.Sprintf("FPS %4.1f", ebiten.ActualFPS()), 10, ScreenHeight-18)
+			fmt.Sprintf("FPS %4.1f", ebiten.ActualFPS()), ScreenWidth-90, ScreenHeight-18)
+	}
+
+	// Stage-1 onboarding hints. Two stages keyed to game events, not
+	// stroke count: "DRAG" teaches the input, "ENCLOSE" teaches the goal
+	// and persists until the player actually seals a pocket. Three random
+	// strokes won't always form a sealable shape, so a stroke-counted
+	// hint would leave the player at "1 MORE" with no way forward.
+	if g.state == StatePlaying && g.currentStage == 0 && g.tutorialStep < 2 {
+		hint := "DRAG"
+		if g.tutorialStep == 1 {
+			hint = "ENCLOSE"
+		}
+		g.drawCenterFace(screen, hint, ScreenHeight-60, g.faceLarge, white)
+	}
+
+	// SEALED! flash: triggered the frame claimEnclosure removed at least one
+	// enemy. Loud, brief, center-screen — sells the "your shape just killed
+	// something" causality that the silent enemy disappearance otherwise
+	// hides under the slash glow. Gated on StatePlaying so it doesn't stack
+	// on top of the CLEAR message when the killing blow also empties the
+	// board (same frame: sealedFlashFrames is set AND state flips to
+	// StateCleared, and Update stops ticking, so the flash would freeze
+	// underneath CLEAR forever).
+	if g.sealedFlashFrames > 0 && g.state == StatePlaying {
+		alphaT := float64(g.sealedFlashFrames) / 30.0
+		if alphaT > 1 {
+			alphaT = 1
+		}
+		c := color.NRGBA{255, 240, 180, uint8(255 * alphaT)}
+		g.drawCenterFace(screen, "SEALED!", ScreenHeight/2-20, g.faceLarge, c)
 	}
 
 	switch g.state {
 	case StateTitle:
-		drawCenter(screen, "R I F T", ScreenHeight/2-40)
-		drawCenter(screen, "Drag a straight slash. Short drag = short beam, long drag = long beam.", ScreenHeight/2-10)
-		drawCenter(screen, "Encircle the dark to seal every foe before time runs out.", ScreenHeight/2+4)
-		drawCenter(screen, "[Click or Space to start]", ScreenHeight/2+34)
+		g.drawCenterFace(screen, "RIFT", ScreenHeight/2-70, g.faceLarge, white)
+		g.drawCenterFace(screen, "DRAG.  SLASH.  ENCLOSE.  SEAL.", ScreenHeight/2-10, g.faceMid, white)
+		g.drawCenterFace(screen, "Click / Space", ScreenHeight/2+50, g.faceSmall, dim)
 	case StateCleared:
-		next := g.currentStage + 2 // 1-indexed display of the next stage
+		g.drawCenterFace(screen, "CLEAR", ScreenHeight/2-20, g.faceLarge, gold)
 		if g.currentStage+1 >= len(stages) {
-			drawCenter(screen, "S T A G E   C L E A R", ScreenHeight/2-10)
-			drawCenter(screen, "Final stage cleared!", ScreenHeight/2+14)
+			g.drawCenterFace(screen, "Final stage", ScreenHeight/2+20, g.faceSmall, dim)
 		} else {
-			drawCenter(screen, "S T A G E   C L E A R", ScreenHeight/2-10)
-			drawCenter(screen, fmt.Sprintf("Stage %d coming up...", next), ScreenHeight/2+14)
+			next := g.currentStage + 2
+			g.drawCenterFace(screen, fmt.Sprintf("Next: Stage %d", next), ScreenHeight/2+20, g.faceSmall, dim)
 		}
 	case StateGameOver:
-		drawCenter(screen, "T I M E   U P", ScreenHeight/2-10)
-		drawCenter(screen, "[Click to retry this stage]", ScreenHeight/2+14)
+		g.drawCenterFace(screen, "TIME UP", ScreenHeight/2-20, g.faceLarge, color.NRGBA{255, 150, 150, 255})
+		g.drawCenterFace(screen, "Click / Space", ScreenHeight/2+20, g.faceSmall, dim)
 	case StateAllCleared:
-		drawCenter(screen, "A L L   C L E A R", ScreenHeight/2-20)
-		drawCenter(screen, "You painted the night.", ScreenHeight/2+4)
-		drawCenter(screen, "[Click to return to title]", ScreenHeight/2+28)
+		g.drawCenterFace(screen, "ALL CLEAR", ScreenHeight/2-20, g.faceLarge, gold)
+		g.drawCenterFace(screen, "Click / Space", ScreenHeight/2+20, g.faceSmall, dim)
 	}
 }
 
-func drawCenter(screen *ebiten.Image, msg string, y int) {
-	w := len(msg) * 6
-	ebitenutil.DebugPrintAt(screen, msg, ScreenWidth/2-w/2, y)
+// drawCenter horizontally centers msg at the given baseline y using the
+// medium face. Kept as the default text path so existing call sites stay
+// terse; use drawCenterFace for larger or smaller text.
+func (g *Game) drawCenter(screen *ebiten.Image, msg string, y int) {
+	g.drawCenterFace(screen, msg, y, g.faceMid, color.NRGBA{230, 240, 255, 255})
+}
+
+func (g *Game) drawCenterFace(screen *ebiten.Image, msg string, y int, face *text.GoTextFace, c color.Color) {
+	w, _ := text.Measure(msg, face, 0)
+	op := &text.DrawOptions{}
+	op.GeoM.Translate(float64(ScreenWidth)/2-w/2, float64(y))
+	op.ColorScale.ScaleWithColor(c)
+	text.Draw(screen, msg, face, op)
+}
+
+// drawAt is a thin convenience wrapper that places msg at the given
+// top-left pixel with the chosen face and color. Anchor is "top" because
+// text/v2 baselines from the top-left when no PrimaryAlign is set.
+func (g *Game) drawAt(screen *ebiten.Image, msg string, x, y int, face *text.GoTextFace, c color.Color) {
+	op := &text.DrawOptions{}
+	op.GeoM.Translate(float64(x), float64(y))
+	op.ColorScale.ScaleWithColor(c)
+	text.Draw(screen, msg, face, op)
 }
 
 func (g *Game) Layout(outsideW, outsideH int) (int, int) {
