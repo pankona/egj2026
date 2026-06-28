@@ -86,6 +86,32 @@ const (
 	MagicCircleRadiusPx     = 22 * CellSize     // px (176)
 	MagicCircleSpawnInsetPx = 4 * CellSize      // px; enemies spawn this far inside the rim
 	MagicCircleEdgePushBack = 0.6               // velocity nudge per frame applied when an enemy is at/outside the rim
+
+	// Stage-clear post-process: when a stage clears, the grid is rewritten
+	// as the dihedral-4 group's 8 symmetric copies of itself around the
+	// magic-circle center (4 rotations + 4 mirror reflections). All 8
+	// transforms are integer cell-coordinate operations that align exactly
+	// with the 8px grid, so the final mandala has *exact* 8-fold symmetry
+	// within the inscribed rectangle — no quantization slop that would
+	// otherwise appear if we used 45° rotations on a Cartesian grid (the
+	// 45° rotated source cell positions never land on cell centers, so
+	// nearest-neighbor sampling makes alternating wedges slightly off-axis
+	// and the mandala reads as 4-fold-with-doubling rather than even
+	// 8-fold). The 7 non-identity transforms are stamped one per
+	// KaleidoFoldFrames so the mandala assembles itself in front of the
+	// player; ClearCooldownFrames adds linger time after the animation
+	// completes before the player's click is accepted for the next stage.
+	KaleidoscopeFolds   = 8  // total dihedral transforms (identity + 7); animation applies 7
+	KaleidoFoldFrames   = 8  // frames between transform steps (60 fps; 7×8 = 56 ≈ ~0.9s)
+	ClearCooldownFrames = 90 // postClearCooldown for StateCleared (anim + linger)
+
+	// Palette softness: amount of white mixed into the saturated hue
+	// returned by hueToRGB. 0 = vivid HSV chroma (the old behavior,
+	// reads as harsh primaries on dark background); 1 = pure white. The
+	// non-zero floor pushes the palette toward pastel/stained-glass
+	// tints, which match the "softly glowing seal" aesthetic better
+	// than the raw saturated primaries.
+	PaletteSoftness = 0.35
 )
 
 // Stage describes one playable level. The 10-stage progression in the GDD
@@ -214,6 +240,17 @@ type Game struct {
 	// causal link between the closing slash and the kill.
 	tutorialStep      int
 	sealedFlashFrames int
+
+	// Stage-clear kaleidoscope animation state. On StateCleared entry the
+	// current grid is snapshotted into kaleidoSnapshot and the
+	// KaleidoscopeFolds-1 rotated copies are stamped onto the live grid
+	// one fold every KaleidoFoldFrames frames, so the mandala assembles
+	// itself in front of the player instead of popping in. kaleidoNextFold
+	// is the next rotation index (1..KaleidoscopeFolds-1) waiting to be
+	// applied; 0 means idle, >= KaleidoscopeFolds means done.
+	kaleidoSnapshot  [GridWidth][GridHeight]Cell
+	kaleidoNextFold  int
+	kaleidoFoldTimer int
 
 	// Fonts are shared by every drawing path. faceLarge is reserved for
 	// hero text (title, big mid-screen flashes); faceMid for HUD primary
@@ -356,11 +393,24 @@ func (g *Game) Update() error {
 	case StateCleared:
 		if g.postClearCooldown > 0 {
 			g.postClearCooldown--
+			// Drive the mandala animation alongside the cooldown so the
+			// 7 rotated copies stamp in one-per-KaleidoFoldFrames over
+			// roughly the first second of the clear screen. The cooldown
+			// also acts as an input-grace window so the same click that
+			// finished off the last enemy can't immediately skip past
+			// the seal animation.
+			g.tickKaleidoscope()
 			break
 		}
-		g.loadStage(g.currentStage + 1)
-		if g.state != StateAllCleared {
-			g.state = StatePlaying
+		// Mandala is complete; wait for the player to acknowledge before
+		// advancing. Mirrors StateGameOver / StateAllCleared so the seal
+		// gets a held beat rather than auto-scrolling out from under the
+		// player.
+		if pointerJustPressed() || inpututil.IsKeyJustPressed(ebiten.KeySpace) {
+			g.loadStage(g.currentStage + 1)
+			if g.state != StateAllCleared {
+				g.state = StatePlaying
+			}
 		}
 	case StateGameOver:
 		if g.postClearCooldown > 0 {
@@ -513,7 +563,12 @@ func (g *Game) updatePlaying() {
 	// frame no enemies remain. Light percent is now a feedback HUD only.
 	if len(g.enemies) == 0 {
 		g.state = StateCleared
-		g.postClearCooldown = 60
+		g.postClearCooldown = ClearCooldownFrames
+		// Arm the mandala animation. tickKaleidoscope runs every frame
+		// during the cooldown and stamps one rotated copy at a time, so
+		// the player watches the sealed pattern assemble itself instead
+		// of seeing it pop in.
+		g.beginKaleidoscope()
 	}
 }
 
@@ -1295,6 +1350,105 @@ func (g *Game) bindEnclosure() {
 	}
 }
 
+// beginKaleidoscope snapshots the grid at the moment of stage clear and
+// arms the animation: subsequent tickKaleidoscope() calls will stamp one
+// rotated copy at a time onto g.grid. Sampling from a frozen snapshot
+// (not from g.grid itself) keeps each fold independent — otherwise fold
+// 2 would pick up fold 1's freshly-stamped paint and the brightness
+// would cascade unpredictably around the circle.
+func (g *Game) beginKaleidoscope() {
+	g.kaleidoSnapshot = g.grid
+	g.kaleidoNextFold = 1 // fold 0 is the original, already in g.grid
+	g.kaleidoFoldTimer = 0
+}
+
+// tickKaleidoscope advances the stage-clear animation by one frame. Once
+// per KaleidoFoldFrames it stamps the next dihedral transform from the
+// snapshot onto g.grid, then increments kaleidoNextFold. When
+// kaleidoNextFold reaches KaleidoscopeFolds the animation is done and
+// subsequent calls are no-ops until the next stage's beginKaleidoscope.
+//
+// Steps map directly to dihedralTransform indices (1..7). Order chosen
+// for visual growth: 180° opposite first, then the two axis mirrors,
+// then the 90° rotation pair, then the diagonal mirror pair.
+func (g *Game) tickKaleidoscope() {
+	if g.kaleidoNextFold == 0 || g.kaleidoNextFold >= KaleidoscopeFolds {
+		return
+	}
+	g.kaleidoFoldTimer++
+	if g.kaleidoFoldTimer < KaleidoFoldFrames {
+		return
+	}
+	g.kaleidoFoldTimer = 0
+	g.applyKaleidoscopeFold(g.kaleidoNextFold)
+	g.kaleidoNextFold++
+}
+
+// applyKaleidoscopeFold stamps one of the dihedral-4 group's
+// transformations (idx 1..7; idx 0 is the identity, already in g.grid at
+// snapshot time) of g.kaleidoSnapshot onto g.grid, taking max-Light per
+// cell so already-bright cells aren't dimmed by a dark sample. All 8
+// transforms are integer cell-coordinate operations (see
+// dihedralTransform), so the final mandala has exact 8-fold dihedral
+// symmetry within the inscribed rectangle. Cells whose transformed
+// source falls outside the playfield (rectangular-screen corners that
+// would have to come from off-screen under 90° rotation) are skipped.
+func (g *Game) applyKaleidoscopeFold(idx int) {
+	for x := 0; x < GridWidth; x++ {
+		for y := 0; y < GridHeight; y++ {
+			sx, sy := dihedralTransform(idx, x, y)
+			if sx < 0 || sx >= GridWidth || sy < 0 || sy >= GridHeight {
+				continue
+			}
+			cand := g.kaleidoSnapshot[sx][sy]
+			if cand.Light > g.grid[x][y].Light {
+				g.grid[x][y] = cand
+			}
+		}
+	}
+}
+
+// dihedralTransform returns the source cell (sa, sb) that output cell
+// (a, b) inherits its value from under dihedral-4 transform idx. The
+// rotation center is the magic-circle center, which sits exactly on the
+// (40, 30) cell corner — so all 8 transforms are exact integer cell
+// remappings with no quantization.
+//
+// Indices:
+//   0: identity
+//   1: 180° rotation around center
+//   2: vertical mirror (left↔right across the centerline)
+//   3: horizontal mirror (top↔bottom across the centerline)
+//   4: 90° CCW rotation
+//   5: 90° CW rotation
+//   6: diagonal mirror across y=x (through center)
+//   7: diagonal mirror across y=-x (through center)
+//
+// 90° rotations and diagonal mirrors mix the W and H halves of the
+// rectangular grid; for cells outside the inscribed square the
+// transformed coordinate goes out of range and applyKaleidoscopeFold
+// skips them. The magic circle (radius 22 cells) lies fully inside the
+// inscribed square, so the visible mandala region is always covered.
+func dihedralTransform(idx, a, b int) (int, int) {
+	switch idx {
+	case 1: // 180° rotation
+		return GridWidth - 1 - a, GridHeight - 1 - b
+	case 2: // vertical mirror
+		return GridWidth - 1 - a, b
+	case 3: // horizontal mirror
+		return a, GridHeight - 1 - b
+	case 4: // 90° CCW rotation
+		return GridWidth/2 + GridHeight/2 - 1 - b, a - (GridWidth/2 - GridHeight/2)
+	case 5: // 90° CW rotation
+		return GridWidth/2 - GridHeight/2 + b, GridWidth/2 + GridHeight/2 - 1 - a
+	case 6: // diagonal mirror across y=x
+		return GridWidth/2 - GridHeight/2 + b, a - (GridWidth/2 - GridHeight/2)
+	case 7: // diagonal mirror across y=-x
+		return GridWidth/2 + GridHeight/2 - 1 - b, GridWidth/2 + GridHeight/2 - 1 - a
+	}
+	return a, b // idx 0 or unknown: identity
+}
+
 func (g *Game) rasterizeBindLine(x0, y0, x1, y1 float64, dark *[GridWidth][GridHeight]bool) {
 	length := math.Hypot(x1-x0, y1-y0)
 	steps := int(length) + 1
@@ -1495,6 +1649,14 @@ func hueToRGB(h float64) (float32, float32, float32) {
 	default:
 		r, g, b = c, 0, x
 	}
+	// Soften the fully-saturated HSV output toward white. Pure HSV
+	// primaries read as harsh on the dark background; mixing in some
+	// white pushes the palette toward stained-glass pastels while
+	// preserving hue separation.
+	s := PaletteSoftness
+	r = r*(1-s) + s
+	g = g*(1-s) + s
+	b = b*(1-s) + s
 	return float32(r), float32(g), float32(b)
 }
 
@@ -1933,12 +2095,20 @@ func (g *Game) Draw(screen *ebiten.Image) {
 		g.drawCenterFace(screen, "Click / Space", ScreenHeight/2+50, g.faceSmall, dim)
 	case StateCleared:
 		g.drawCenterFace(screen, "CLEAR", ScreenHeight/2-20, g.faceLarge, gold)
-		if g.currentStage+1 >= len(stages) {
-			g.drawCenterFace(screen, "Final stage", ScreenHeight/2+20, g.faceSmall, dim)
+		// During the cooldown the mandala is still assembling; show what
+		// stage is next. Once the cooldown ends we're waiting on the
+		// player's click/space, so swap to the input prompt.
+		var hint string
+		if g.postClearCooldown > 0 {
+			if g.currentStage+1 >= len(stages) {
+				hint = "Final stage"
+			} else {
+				hint = fmt.Sprintf("Next: Stage %d", g.currentStage+2)
+			}
 		} else {
-			next := g.currentStage + 2
-			g.drawCenterFace(screen, fmt.Sprintf("Next: Stage %d", next), ScreenHeight/2+20, g.faceSmall, dim)
+			hint = "Click / Space"
 		}
+		g.drawCenterFace(screen, hint, ScreenHeight/2+20, g.faceSmall, dim)
 	case StateGameOver:
 		g.drawCenterFace(screen, "TIME UP", ScreenHeight/2-20, g.faceLarge, color.NRGBA{255, 150, 150, 255})
 		g.drawCenterFace(screen, "Click / Space", ScreenHeight/2+20, g.faceSmall, dim)
