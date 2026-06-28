@@ -17,6 +17,7 @@ build-wasm:
 	GOOS=js GOARCH=wasm go build -o dist/main.wasm .
 	cp $$(go env GOROOT)/lib/wasm/wasm_exec.js dist/
 	cp web/* dist/
+	sed -i "s/__WASM_SIZE__/$$(wc -c < dist/main.wasm)/" dist/game.html
 
 serve-wasm: build-wasm
 	go run ./devserver
