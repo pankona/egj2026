@@ -68,6 +68,24 @@ const (
 	BindHoldFrames     = 120 // line growth phase; seal happens on its last frame
 	BindRangeCells     = 60  // skip pairs farther apart than this (cells)
 	BindEdgeWidthCells = 1   // half-thickness of the dark line when rasterized
+
+	// Magic circle: a centered ring drawn as background flavor. The lore is
+	// "the outer perimeter seal that holds the dark in, still maintained by
+	// previous wards." Mechanically it's a soft leash: enemies prefer light
+	// edges inside it and are nudged back if they drift out. The player
+	// is unconstrained — slashes can originate and land anywhere on screen.
+	// This solves the corner-hugging UX trap (slashes must originate inside
+	// the playfield, so wrapping a corner-pinned foe in 3 slashes leaves
+	// almost no maneuver room).
+	//
+	// Radius is sized so the interior is ~32% of the playfield, sitting just
+	// below MaxClaimRatio (when that lands) so a perfectly-claimed full
+	// interior won't trip the cap.
+	MagicCircleCX           = ScreenWidth / 2   // px center X
+	MagicCircleCY           = ScreenHeight / 2  // px center Y
+	MagicCircleRadiusPx     = 22 * CellSize     // px (176)
+	MagicCircleSpawnInsetPx = 4 * CellSize      // px; enemies spawn this far inside the rim
+	MagicCircleEdgePushBack = 0.6               // velocity nudge per frame applied when an enemy is at/outside the rim
 )
 
 // Stage describes one playable level. The 10-stage progression in the GDD
@@ -140,6 +158,11 @@ type Enemy struct {
 	// ID is a stable identifier for severed-pair tracking; assigned in
 	// loadStage. Zero means "not assigned" (boss/tutorial enemies).
 	ID int
+
+	// EdgeGlow tracks how recently this enemy pushed against the magic
+	// circle rim. Ramps to 1 on contact, decays per frame; Draw uses it
+	// to flash the seal where the dark touched it.
+	EdgeGlow float64
 }
 
 type GameState int
@@ -269,6 +292,7 @@ func (g *Game) loadStage(idx int) {
 	if s.HarmlessEnemy {
 		effectR = 0
 	}
+	spawnR := float64(MagicCircleRadiusPx - MagicCircleSpawnInsetPx)
 	for i := 0; i < s.Enemies; i++ {
 		// Stage 1 (tutorial) parks its lone foe dead center so the
 		// "ENCLOSE" target is unambiguous and stationary. EnemySpeed
@@ -278,8 +302,14 @@ func (g *Game) loadStage(idx int) {
 		if idx == 0 {
 			ex, ey = ScreenWidth/2, ScreenHeight/2
 		} else {
-			ex = g.rng.Float64()*float64(ScreenWidth-160) + 80
-			ey = g.rng.Float64()*float64(ScreenHeight-160) + 80
+			// Uniform-area sample inside the magic circle interior
+			// (sqrt on the radial draw avoids center clustering).
+			// This keeps foes off the screen edges, where wrapping
+			// them in a polygon would leave no maneuver room.
+			angle := g.rng.Float64() * 2 * math.Pi
+			r := math.Sqrt(g.rng.Float64()) * spawnR
+			ex = float64(MagicCircleCX) + r*math.Cos(angle)
+			ey = float64(MagicCircleCY) + r*math.Sin(angle)
 		}
 		g.enemies = append(g.enemies, &Enemy{
 			ID:           i + 1,
@@ -403,22 +433,51 @@ func (g *Game) updatePlaying() {
 		g.steerEnemy(e)
 		e.X += e.VX
 		e.Y += e.VY
-		margin := e.Radius + 8
-		if e.X < margin {
-			e.X = margin
-			e.VX = -e.VX
-		}
-		if e.X > ScreenWidth-margin {
-			e.X = ScreenWidth - margin
-			e.VX = -e.VX
-		}
-		if e.Y < margin {
-			e.Y = margin
-			e.VY = -e.VY
-		}
-		if e.Y > ScreenHeight-margin {
-			e.Y = ScreenHeight - margin
-			e.VY = -e.VY
+
+		// Edge glow decays smoothly so the rim flash reads as a soft
+		// pulse rather than a hard flicker.
+		e.EdgeGlow *= 0.9
+
+		if e.IsBoss {
+			// The boss isn't leashed to the magic circle — it owns the
+			// whole stage. Keep the rectangular bounce so it stays on
+			// screen with bad initial velocity.
+			margin := e.Radius + 8
+			if e.X < margin {
+				e.X = margin
+				e.VX = -e.VX
+			}
+			if e.X > ScreenWidth-margin {
+				e.X = ScreenWidth - margin
+				e.VX = -e.VX
+			}
+			if e.Y < margin {
+				e.Y = margin
+				e.VY = -e.VY
+			}
+			if e.Y > ScreenHeight-margin {
+				e.Y = ScreenHeight - margin
+				e.VY = -e.VY
+			}
+		} else {
+			// Magic-circle leash: small foes push back into the seal
+			// when they drift past the rim. Combined with the AI
+			// preferring inside-rim targets (findNearestLightEdge),
+			// they live entirely inside the circle without anyone
+			// noticing a "wall."
+			dxc := e.X - float64(MagicCircleCX)
+			dyc := e.Y - float64(MagicCircleCY)
+			dc := math.Hypot(dxc, dyc)
+			maxR := float64(MagicCircleRadiusPx) - e.Radius
+			if dc > maxR && dc > 0.5 {
+				e.VX -= (dxc / dc) * MagicCircleEdgePushBack
+				e.VY -= (dyc / dc) * MagicCircleEdgePushBack
+				// Hard clamp so foes never bleed deep into the
+				// dead zone even with momentum spikes.
+				e.X = float64(MagicCircleCX) + dxc*maxR/dc
+				e.Y = float64(MagicCircleCY) + dyc*maxR/dc
+				e.EdgeGlow = 1
+			}
 		}
 		g.erodeAround(e.X, e.Y, e.EffectRadius)
 	}
@@ -511,11 +570,20 @@ func (g *Game) fireSlash(x0, y0, x1, y1 int) {
 	}
 	nx := dx / dist
 	ny := dy / dist
-	g.stock -= units
 	sx0 := float64(x0)
 	sy0 := float64(y0)
 	sx1 := sx0 + nx*length
 	sy1 := sy0 + ny*length
+	// Clip the beam to the magic circle. If the entire stroke would land
+	// outside the seal, refund the energy and abort silently — the ghost
+	// preview hid itself for the same reason, so the player has already
+	// been told "this isn't going to fire."
+	cx0, cy0, cx1, cy1, inside := clipSegmentToCircle(sx0, sy0, sx1, sy1)
+	if !inside {
+		return
+	}
+	sx0, sy0, sx1, sy1 = cx0, cy0, cx1, cy1
+	g.stock -= units
 	if g.currentStage == 0 && g.tutorialStep == 0 {
 		// First slash fired: advance to "ENCLOSE" prompt. Further advances
 		// happen when claimEnclosure actually seals a pocket, not on stroke
@@ -725,6 +793,15 @@ func (g *Game) findNearestLightEdge(ex, ey, maxPx float64) (int, int, bool) {
 			if g.grid[x][y].Light < WallLightThreshold {
 				continue
 			}
+			// Skip targets outside the magic circle so foes don't
+			// chase light into corners where they can't comfortably
+			// reach. Paired with the push-back in updatePlaying this
+			// keeps enemies "living inside the seal."
+			ccx := float64(x*CellSize+CellSize/2) - float64(MagicCircleCX)
+			ccy := float64(y*CellSize+CellSize/2) - float64(MagicCircleCY)
+			if ccx*ccx+ccy*ccy > float64(MagicCircleRadiusPx)*float64(MagicCircleRadiusPx) {
+				continue
+			}
 			edge := false
 			for _, n := range [4][2]int{{1, 0}, {-1, 0}, {0, 1}, {0, -1}} {
 				nx, ny := x+n[0], y+n[1]
@@ -829,6 +906,12 @@ func (g *Game) claimEnclosure() {
 				p := queue[0]
 				queue = queue[1:]
 				if p[0] == 1 || p[0] == GridWidth-2 || p[1] == 1 || p[1] == GridHeight-2 {
+					touchesBorder = true
+				}
+				// Cells outside the magic circle act as if they touch
+				// the screen border, so claims that wrap around or
+				// extend outside the seal can't sweep leashed foes.
+				if cellOutsideMagicCircle(p[0], p[1]) {
 					touchesBorder = true
 				}
 				for _, d := range [4][2]int{{1, 0}, {-1, 0}, {0, 1}, {0, -1}} {
@@ -1141,6 +1224,16 @@ func (g *Game) bindEnclosure() {
 			if g.grid[x][y].Light < wall {
 				dark[x][y] = true
 			}
+			// Cells outside the magic circle act as walls for bind
+			// analysis, mirroring claimEnclosure's rule. This stops
+			// the player from "tanking" bind by extending a paint
+			// bridge from inside to outside the circle, which would
+			// otherwise keep every inner lit pocket connected to a
+			// vast outer pool and make the largest-component test
+			// trivially safe.
+			if cellOutsideMagicCircle(x, y) {
+				dark[x][y] = true
+			}
 		}
 	}
 	for _, pair := range edges {
@@ -1324,6 +1417,62 @@ func cross2(ax, ay, bx, by float64) float64 {
 	return ax*by - ay*bx
 }
 
+// cellOutsideMagicCircle reports whether a grid cell's center sits outside
+// the magic circle. claimEnclosure treats such cells as "outside-equivalent"
+// so any flood-fill component containing them is excluded from claims —
+// otherwise the player could draw a giant triangle wrapping the whole
+// screen from outside the circle and sweep every leashed foe in one claim.
+func cellOutsideMagicCircle(cx, cy int) bool {
+	px := cx*CellSize + CellSize/2 - MagicCircleCX
+	py := cy*CellSize + CellSize/2 - MagicCircleCY
+	return px*px+py*py > MagicCircleRadiusPx*MagicCircleRadiusPx
+}
+
+// clipSegmentToCircle clips a slash segment to the magic-circle interior.
+// The seal mechanically contains the rite: only the inside portion of any
+// stroke can paint cells or land a claim. Returns ok=false when the segment
+// lies entirely outside the circle (no intersection at all), so callers
+// know to refund energy or hide the ghost preview rather than show a beam
+// that wouldn't actually do anything.
+func clipSegmentToCircle(x0, y0, x1, y1 float64) (rx0, ry0, rx1, ry1 float64, ok bool) {
+	cx := float64(MagicCircleCX)
+	cy := float64(MagicCircleCY)
+	r := float64(MagicCircleRadiusPx)
+	dx := x1 - x0
+	dy := y1 - y0
+	a := dx*dx + dy*dy
+	if a < 1e-9 {
+		// Single point: inside iff within radius.
+		ex := x0 - cx
+		ey := y0 - cy
+		if ex*ex+ey*ey > r*r {
+			return 0, 0, 0, 0, false
+		}
+		return x0, y0, x0, y0, true
+	}
+	fx := x0 - cx
+	fy := y0 - cy
+	b := 2 * (fx*dx + fy*dy)
+	c := fx*fx + fy*fy - r*r
+	disc := b*b - 4*a*c
+	if disc < 0 {
+		return 0, 0, 0, 0, false
+	}
+	sq := math.Sqrt(disc)
+	t0 := (-b - sq) / (2 * a)
+	t1 := (-b + sq) / (2 * a)
+	if t0 > 1 || t1 < 0 {
+		return 0, 0, 0, 0, false
+	}
+	if t0 < 0 {
+		t0 = 0
+	}
+	if t1 > 1 {
+		t1 = 1
+	}
+	return x0 + dx*t0, y0 + dy*t0, x0 + dx*t1, y0 + dy*t1, true
+}
+
 func hueToRGB(h float64) (float32, float32, float32) {
 	h = math.Mod(h, 360)
 	if h < 0 {
@@ -1367,6 +1516,50 @@ func (g *Game) Draw(screen *ebiten.Image) {
 	op := &ebiten.DrawImageOptions{}
 	op.GeoM.Scale(CellSize, CellSize)
 	screen.DrawImage(g.gridImg, op)
+
+	// Background flavor: the magic circle is the "outer perimeter seal,"
+	// the still-living ward from previous keepers. The player's light is
+	// the inner pattern being relit; the foes are leashed inside the rim.
+	// Drawn after the grid with low alpha — bright cells overdraw it where
+	// they shine, so it reads only against the dark.
+	mcx, mcy := float32(MagicCircleCX), float32(MagicCircleCY)
+	mcr := float32(MagicCircleRadiusPx)
+	vector.StrokeCircle(screen, mcx, mcy, mcr, 1.5, color.RGBA{100, 78, 42, 130}, true)
+	vector.StrokeCircle(screen, mcx, mcy, mcr*0.72, 1, color.RGBA{70, 55, 30, 90}, true)
+
+	// Lesser seals in the dead space — vestiges of older wards that
+	// have lost their power. Pure decoration; tells the story that this
+	// is the "next attempt" in a longer line of keepers.
+	lesserA := color.RGBA{55, 42, 22, 110}
+	for _, q := range [4][2]float32{
+		{ScreenWidth * 0.10, ScreenHeight * 0.18},
+		{ScreenWidth * 0.90, ScreenHeight * 0.18},
+		{ScreenWidth * 0.10, ScreenHeight * 0.82},
+		{ScreenWidth * 0.90, ScreenHeight * 0.82},
+	} {
+		vector.StrokeCircle(screen, q[0], q[1], 18, 1, lesserA, true)
+		vector.StrokeCircle(screen, q[0], q[1], 9, 1, lesserA, true)
+	}
+
+	// Rim flash where a foe pushed against the seal. Drawn under the
+	// enemies so the contact point reads as the seal reacting, not as
+	// an enemy attribute.
+	for _, e := range g.enemies {
+		if e.IsBoss || e.EdgeGlow < 0.05 {
+			continue
+		}
+		dxc := e.X - float64(MagicCircleCX)
+		dyc := e.Y - float64(MagicCircleCY)
+		dc := math.Hypot(dxc, dyc)
+		if dc < 1 {
+			continue
+		}
+		px := float64(MagicCircleCX) + dxc*float64(MagicCircleRadiusPx)/dc
+		py := float64(MagicCircleCY) + dyc*float64(MagicCircleRadiusPx)/dc
+		a := uint8(200 * e.EdgeGlow)
+		vector.DrawFilledCircle(screen, float32(px), float32(py), 11,
+			color.RGBA{180, 130, 60, a}, true)
+	}
 
 	// Always-lit border frame: visualizes the 1-cell ring that
 	// claimEnclosure treats as permanent wall. Drawn 1 cell thick so the
@@ -1616,24 +1809,34 @@ func (g *Game) Draw(screen *ebiten.Image) {
 		if units, length, ok := slashSpec(dist, g.stock); ok {
 			nx := dxp / dist
 			ny := dyp / dist
-			gx1 := sx + float32(nx*length)
-			gy1 := sy + float32(ny*length)
+			gx1raw := float64(sx) + nx*length
+			gy1raw := float64(sy) + ny*length
 
-			var ghostWidth float32
-			var ghostAlpha uint8
-			var ringR float32
-			switch units {
-			case 1:
-				ghostWidth, ghostAlpha, ringR = 1.0, 90, 4
-			case 2:
-				ghostWidth, ghostAlpha, ringR = 1.8, 140, 7
-			case 3:
-				ghostWidth, ghostAlpha, ringR = 2.6, 210, 11
+			// Mirror fireSlash's clip so the ghost shows exactly what the
+			// beam will become. If the stroke would land entirely outside
+			// the seal the ghost (and ring) hide — the player sees only
+			// the bright drag indicator and learns "aim inside the circle."
+			cx0, cy0, cx1, cy1, inside := clipSegmentToCircle(float64(sx), float64(sy), gx1raw, gy1raw)
+			if inside {
+				var ghostWidth float32
+				var ghostAlpha uint8
+				var ringR float32
+				switch units {
+				case 1:
+					ghostWidth, ghostAlpha, ringR = 1.0, 90, 4
+				case 2:
+					ghostWidth, ghostAlpha, ringR = 1.8, 140, 7
+				case 3:
+					ghostWidth, ghostAlpha, ringR = 2.6, 210, 11
+				}
+				vector.StrokeLine(screen, float32(cx0), float32(cy0), float32(cx1), float32(cy1), ghostWidth,
+					color.RGBA{255, 255, 255, ghostAlpha}, true)
+				// Ring sits at the slash's effective origin (the clipped
+				// start), not necessarily where the finger first landed,
+				// so the player reads "this is where the beam begins."
+				vector.StrokeCircle(screen, float32(cx0), float32(cy0), ringR, 1.5,
+					color.RGBA{255, 255, 255, ghostAlpha}, true)
 			}
-			vector.StrokeLine(screen, sx, sy, gx1, gy1, ghostWidth,
-				color.RGBA{255, 255, 255, ghostAlpha}, true)
-			vector.StrokeCircle(screen, sx, sy, ringR, 1.5,
-				color.RGBA{255, 255, 255, ghostAlpha}, true)
 		}
 		vector.StrokeLine(screen, sx, sy, px, py, 2.5,
 			color.RGBA{255, 255, 255, 220}, true)
