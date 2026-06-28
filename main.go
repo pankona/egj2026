@@ -50,6 +50,21 @@ const (
 	BladeRadius       = 0   // cells (half-thickness of the slash beam; 0 = single-cell hairline. burnSegment patches the 4-connectivity hole that single-cell diagonals would otherwise leave.)
 	SlashHitRadius    = 2   // cells (anchored-enemy hit half-width; kept thicker than BladeRadius so a thin beam still feels generous to land)
 
+	// Energy-shortfall feedback. UnfiredTailFrames is how long the red
+	// "denied length" tail lingers past the actual beam (post-fire, so
+	// the eye is already at the release point). PipFlashFrames is the
+	// matching pulse on the consumed HUD pips. Both decay to nothing
+	// well inside SlashGlowFrames so successive fast strikes don't
+	// stack into one solid blob.
+	UnfiredTailFrames = 8
+	PipFlashFrames    = 16
+
+	// FeedingSpeedFactor scales an enemy's max movement speed while it
+	// is actively eroding lit cells. 0.5 = half speed; turns "drop a
+	// line as bait" into a real tactic without removing the long-term
+	// erosion threat (rate is unchanged).
+	FeedingSpeedFactor = 0.5
+
 	LightThresholdCount = 0.35 // cells with light above this counted as bright
 	WallLightThreshold  = 0.5  // cells brighter than this block flood fill
 
@@ -161,12 +176,23 @@ type Cell struct {
 // reload-induced hue changes don't recolor mid-extension), advances its tip by
 // one Reveal slice per frame, runs claimEnclosure once on full extension, then
 // lingers for SlashGlowFrames as visual residue.
+//
+// HasUnfired / Unfired{From,To} encode "what would have fired if you had
+// enough energy" — set when fireSlash quantizes the drag into a bigger
+// bucket than the player can afford. The tail is rendered as red dashes for
+// a few frames so the player sees the part of the beam the energy budget
+// denied them, instead of silently getting a shorter line.
 type Slash struct {
-	X0, Y0  float64
-	X1, Y1  float64
-	Hue     float64
-	Frame   int
-	claimed bool
+	X0, Y0       float64
+	X1, Y1       float64
+	Hue          float64
+	Frame        int
+	claimed      bool
+	HasUnfired   bool
+	UnfiredFromX float64
+	UnfiredFromY float64
+	UnfiredToX   float64
+	UnfiredToY   float64
 }
 
 type Enemy struct {
@@ -189,6 +215,12 @@ type Enemy struct {
 	// circle rim. Ramps to 1 on contact, decays per frame; Draw uses it
 	// to flash the seal where the dark touched it.
 	EdgeGlow float64
+
+	// Feeding is set whenever the last erodeAround actually darkened a
+	// lit cell. While true, steerEnemy halves the enemy's max speed —
+	// so a slash drawn as bait stalls a foe that drifts onto it, opening
+	// a window to encircle them with the next strikes.
+	Feeding bool
 }
 
 type GameState int
@@ -252,6 +284,15 @@ type Game struct {
 	kaleidoNextFold  int
 	kaleidoFoldTimer int
 
+	// Pip flash: brief red overlay on the HUD pips that were just spent
+	// by a slash. Fast-drag players don't track the ghost preview during
+	// the drag, so the energy-cost feedback has to land at release time
+	// where the eye is already looking. pipFlashFrames decays per frame;
+	// pipFlashFromIdx + pipFlashCount identify the pip slots to overlay.
+	pipFlashFrames  int
+	pipFlashFromIdx int
+	pipFlashCount   int
+
 	// Fonts are shared by every drawing path. faceLarge is reserved for
 	// hero text (title, big mid-screen flashes); faceMid for HUD primary
 	// numbers and tutorial hints; faceSmall for footnotes and reload-state
@@ -312,6 +353,9 @@ func (g *Game) loadStage(idx int) {
 	g.severedPairs = map[[2]int]bool{}
 	g.tutorialStep = 0
 	g.sealedFlashFrames = 0
+	g.pipFlashFrames = 0
+	g.pipFlashFromIdx = 0
+	g.pipFlashCount = 0
 	if s.Boss {
 		g.enemies = append(g.enemies, &Enemy{
 			X:            ScreenWidth / 2,
@@ -529,7 +573,7 @@ func (g *Game) updatePlaying() {
 				e.EdgeGlow = 1
 			}
 		}
-		g.erodeAround(e.X, e.Y, e.EffectRadius)
+		e.Feeding = g.erodeAround(e.X, e.Y, e.EffectRadius)
 	}
 
 	// Claims are not permanent — once the perimeter is chewed through, the
@@ -539,6 +583,9 @@ func (g *Game) updatePlaying() {
 
 	if g.sealedFlashFrames > 0 {
 		g.sealedFlashFrames--
+	}
+	if g.pipFlashFrames > 0 {
+		g.pipFlashFrames--
 	}
 
 	g.stageTime -= 1.0 / 60.0
@@ -609,6 +656,24 @@ func lengthForUnits(u int) float64 {
 	return 0
 }
 
+// bucketedUnitsForDrag is slashSpec's bucket choice with the stock cap
+// removed. fireSlash compares this against the actually-fired unit count
+// to know whether the player was energy-downgraded — i.e. they swung big
+// but only got a 1-unit beam because they were out of stock — and if so,
+// it stashes the missing tail on the Slash so Draw can flash it red.
+func bucketedUnitsForDrag(dragDist float64) int {
+	switch {
+	case dragDist < SlashMinLength:
+		return 0
+	case dragDist < ShortDragMax:
+		return 1
+	case dragDist < MidDragMax:
+		return 2
+	default:
+		return 3
+	}
+}
+
 // fireSlash spawns a slash that starts at the drag's start point and extends
 // in the drag direction for the bucketed length from slashSpec. This means
 // the place the player first touched is the strike origin and the beam fans
@@ -629,6 +694,27 @@ func (g *Game) fireSlash(x0, y0, x1, y1 int) {
 	sy0 := float64(y0)
 	sx1 := sx0 + nx*length
 	sy1 := sy0 + ny*length
+
+	// Energy-shortfall tail: if the drag would have bought a bigger beam
+	// but the stock cap downgraded it, capture the missing tail in
+	// pre-clip coords so Draw can render the denied length as red dashes.
+	// Computed BEFORE the clip mutates sx0..sy1 so the tail's "from" is
+	// the unclipped actual tip, then clipped to the circle so it can't
+	// bleed outside the seal.
+	bucketed := bucketedUnitsForDrag(dist)
+	hasUnfired := false
+	var ufx0, ufy0, ufx1, ufy1 float64
+	if units < bucketed {
+		reqLen := lengthForUnits(bucketed)
+		rx := sx0 + nx*reqLen
+		ry := sy0 + ny*reqLen
+		a0, b0, a1, b1, tailInside := clipSegmentToCircle(sx1, sy1, rx, ry)
+		if tailInside {
+			hasUnfired = true
+			ufx0, ufy0, ufx1, ufy1 = a0, b0, a1, b1
+		}
+	}
+
 	// Clip the beam to the magic circle. If the entire stroke would land
 	// outside the seal, refund the energy and abort silently — the ghost
 	// preview hid itself for the same reason, so the player has already
@@ -638,6 +724,11 @@ func (g *Game) fireSlash(x0, y0, x1, y1 int) {
 		return
 	}
 	sx0, sy0, sx1, sy1 = cx0, cy0, cx1, cy1
+	// Mark the pips that are about to drain BEFORE decrementing stock so
+	// pipFlashFromIdx points at the first consumed slot.
+	g.pipFlashFromIdx = g.stock - units
+	g.pipFlashCount = units
+	g.pipFlashFrames = PipFlashFrames
 	g.stock -= units
 	if g.currentStage == 0 && g.tutorialStep == 0 {
 		// First slash fired: advance to "ENCLOSE" prompt. Further advances
@@ -651,11 +742,16 @@ func (g *Game) fireSlash(x0, y0, x1, y1 int) {
 		g.repositionTutorialFoeAwayFrom(sx0, sy0, sx1, sy1)
 	}
 	g.slashes = append(g.slashes, &Slash{
-		X0:  sx0,
-		Y0:  sy0,
-		X1:  sx1,
-		Y1:  sy1,
-		Hue: g.hue,
+		X0:           sx0,
+		Y0:           sy0,
+		X1:           sx1,
+		Y1:           sy1,
+		Hue:          g.hue,
+		HasUnfired:   hasUnfired,
+		UnfiredFromX: ufx0,
+		UnfiredFromY: ufy0,
+		UnfiredToX:   ufx1,
+		UnfiredToY:   ufy1,
 	})
 
 	// Anchored enemies are vulnerable: a slash that grazes them removes the
@@ -822,11 +918,19 @@ func (g *Game) steerEnemy(e *Enemy) {
 		return
 	}
 	const steer = 0.25
-	e.VX = e.VX*(1-steer) + (dx/d)*e.Speed*steer
-	e.VY = e.VY*(1-steer) + (dy/d)*e.Speed*steer
-	if sp := math.Hypot(e.VX, e.VY); sp > e.Speed {
-		e.VX *= e.Speed / sp
-		e.VY *= e.Speed / sp
+	// A foe that is actively eroding lit cells is "feeding" — halve its
+	// max speed so a bait line really stalls it. The feeding flag is set
+	// by last frame's erodeAround, so the slowdown lags movement by one
+	// frame; imperceptible at 60fps and avoids re-ordering the loop.
+	maxSpeed := e.Speed
+	if e.Feeding {
+		maxSpeed *= FeedingSpeedFactor
+	}
+	e.VX = e.VX*(1-steer) + (dx/d)*maxSpeed*steer
+	e.VY = e.VY*(1-steer) + (dy/d)*maxSpeed*steer
+	if sp := math.Hypot(e.VX, e.VY); sp > maxSpeed {
+		e.VX *= maxSpeed / sp
+		e.VY *= maxSpeed / sp
 	}
 }
 
@@ -886,11 +990,16 @@ func (g *Game) findNearestLightEdge(ex, ey, maxPx float64) (int, int, bool) {
 
 // erodeAround dims lit cells around the point. Cells on the light boundary
 // (adjacent to a dark cell) erode faster, giving the visible "chewing the
-// edge" effect.
-func (g *Game) erodeAround(x, y, radius float64) {
+// edge" effect. Returns true if any lit cell was actually darkened — used
+// upstream to flag the enemy as "feeding" for the bait-line slowdown.
+func (g *Game) erodeAround(x, y, radius float64) bool {
+	if radius <= 0 {
+		return false
+	}
 	cx := int(x) / CellSize
 	cy := int(y) / CellSize
 	rcell := int(radius/CellSize) + 1
+	eroded := false
 	for dx := -rcell; dx <= rcell; dx++ {
 		for dy := -rcell; dy <= rcell; dy++ {
 			px := cx + dx
@@ -926,8 +1035,10 @@ func (g *Game) erodeAround(x, y, radius float64) {
 			if c.Light < 0 {
 				c.Light = 0
 			}
+			eroded = true
 		}
 	}
+	return eroded
 }
 
 // claimEnclosure splits the playfield (everything inside the always-wall
@@ -1944,6 +2055,30 @@ func (g *Game) Draw(screen *ebiten.Image) {
 			vector.StrokeCircle(screen, startX, startY, r, 2,
 				color.RGBA{255, 255, 255, a}, true)
 		}
+
+		// Energy-shortfall tail: red dashes continuing past the actual
+		// tip, showing the beam the player asked for but couldn't afford.
+		// Brief and loud so a fast-drag player notices it at release time
+		// (where the eye already is) without needing to track the ghost.
+		if sl.HasUnfired && sl.Frame < UnfiredTailFrames {
+			t := 1 - float64(sl.Frame)/float64(UnfiredTailFrames)
+			tailA := uint8(220 * t)
+			udx := sl.UnfiredToX - sl.UnfiredFromX
+			udy := sl.UnfiredToY - sl.UnfiredFromY
+			const dashes = 4
+			const on = 0.6 // fraction of each dash slot that's drawn
+			for i := 0; i < dashes; i++ {
+				t0 := float64(i) / float64(dashes)
+				t1 := t0 + on/float64(dashes)
+				ax := sl.UnfiredFromX + udx*t0
+				ay := sl.UnfiredFromY + udy*t0
+				bx := sl.UnfiredFromX + udx*t1
+				by := sl.UnfiredFromY + udy*t1
+				vector.StrokeLine(screen, float32(ax), float32(ay),
+					float32(bx), float32(by), 2.5,
+					color.RGBA{255, 70, 60, tailA}, true)
+			}
+		}
 	}
 
 	// Drag preview. The slash starts at the drag start point and extends in
@@ -2012,6 +2147,18 @@ func (g *Game) Draw(screen *ebiten.Image) {
 	pipY := float32(14)
 	pipR := float32(5)
 	pipGap := float32(16)
+	// Pip-flash band: a translucent red strip behind the just-consumed
+	// pips. Drawn first so it sits under the pip glyphs. The expanding
+	// per-pip ring (below) adds a second peripheral cue — together they
+	// give a fast-drag player something to notice without needing to
+	// stare at the HUD.
+	if g.pipFlashFrames > 0 && g.pipFlashCount > 0 {
+		t := float32(g.pipFlashFrames) / float32(PipFlashFrames)
+		bandX := 14 + float32(g.pipFlashFromIdx)*pipGap - pipGap/2
+		bandW := float32(g.pipFlashCount) * pipGap
+		vector.DrawFilledRect(screen, bandX, pipY-pipR-5, bandW, pipR*2+10,
+			color.RGBA{255, 60, 40, uint8(140 * t)}, false)
+	}
 	for i := 0; i < MaxStock; i++ {
 		cx := 14 + float32(i)*pipGap
 		if i < g.stock {
@@ -2020,6 +2167,12 @@ func (g *Game) Draw(screen *ebiten.Image) {
 		} else {
 			vector.StrokeCircle(screen, cx, pipY, pipR, 1.5,
 				color.RGBA{120, 140, 160, 220}, true)
+		}
+		if g.pipFlashFrames > 0 && i >= g.pipFlashFromIdx && i < g.pipFlashFromIdx+g.pipFlashCount {
+			t := float32(g.pipFlashFrames) / float32(PipFlashFrames)
+			ringR := pipR + 3 + 4*t
+			vector.StrokeCircle(screen, cx, pipY, ringR, 2,
+				color.RGBA{255, 100, 80, uint8(230 * t)}, true)
 		}
 	}
 	if g.stock < MaxStock {
