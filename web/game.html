@@ -23,9 +23,57 @@
             margin: 0 auto;
             touch-action: none;
         }
+        #loader {
+            position: fixed;
+            inset: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            background: #000;
+            color: #fff;
+            font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+            transition: opacity 0.4s ease-out;
+            z-index: 10;
+        }
+        #loader.done {
+            opacity: 0;
+            pointer-events: none;
+        }
+        #loader-title {
+            font-size: 44px;
+            letter-spacing: 0.35em;
+            margin: 0 0 28px 0.35em;
+            opacity: 0.92;
+            font-weight: 300;
+        }
+        #loader-bar {
+            width: 220px;
+            height: 2px;
+            background: rgba(255, 255, 255, 0.14);
+            overflow: hidden;
+        }
+        #loader-bar-fill {
+            width: 0%;
+            height: 100%;
+            background: #fff;
+            transition: width 0.18s linear;
+        }
+        #loader-text {
+            margin-top: 14px;
+            font-size: 11px;
+            letter-spacing: 0.15em;
+            color: rgba(255, 255, 255, 0.5);
+            font-variant-numeric: tabular-nums;
+        }
     </style>
 </head>
 <body>
+    <div id="loader">
+        <div id="loader-title">RIFT</div>
+        <div id="loader-bar"><div id="loader-bar-fill"></div></div>
+        <div id="loader-text">LOADING</div>
+    </div>
     <script src="wasm_exec.js"></script>
     <script>
         // Prevent iOS Safari from scrolling/zooming on touch.
@@ -33,11 +81,78 @@
             document.addEventListener(ev, e => e.preventDefault(), { passive: false });
         });
 
-        const go = new Go();
-        const wasmURL = "main.wasm?v=" + new Date().getTime();
-        WebAssembly.instantiateStreaming(fetch(wasmURL), go.importObject).then(result => {
-            go.run(result.instance);
-        });
+        const loader = document.getElementById('loader');
+        const fill = document.getElementById('loader-bar-fill');
+        const text = document.getElementById('loader-text');
+
+        // Build-time substitution. Falls back to ~20 MB when unsubstituted.
+        const EXPECTED_WASM_SIZE = parseInt('__WASM_SIZE__', 10) || 20 * 1024 * 1024;
+
+        function formatMB(bytes) {
+            return (bytes / (1024 * 1024)).toFixed(1);
+        }
+
+        // Tee the download through a progress-reporting stream so we keep
+        // streaming compilation while still surfacing bytes received.
+        async function streamingFetchWithProgress(url) {
+            const response = await fetch(url);
+            if (!response.ok) {
+                throw new Error('fetch failed: HTTP ' + response.status);
+            }
+
+            // When the server uses Content-Encoding: gzip the body reader yields
+            // decoded bytes but Content-Length reports the wire size. Prefer the
+            // build-time wasm size; fall back to Content-Length only when the
+            // response is uncompressed.
+            const ce = (response.headers.get('Content-Encoding') || '').toLowerCase();
+            const compressed = /\b(gzip|br|deflate)\b/.test(ce);
+            const headerLen = parseInt(response.headers.get('Content-Length') || '0', 10);
+            const total = compressed || !headerLen ? EXPECTED_WASM_SIZE : headerLen;
+
+            const reader = response.body.getReader();
+            let received = 0;
+
+            const stream = new ReadableStream({
+                async pull(controller) {
+                    const { done, value } = await reader.read();
+                    if (done) {
+                        controller.close();
+                        return;
+                    }
+                    received += value.length;
+                    const pct = Math.min(100, (received / total) * 100);
+                    fill.style.width = pct.toFixed(1) + '%';
+                    text.textContent = Math.floor(pct) + '%  ' + formatMB(received) + ' MB';
+                    controller.enqueue(value);
+                }
+            });
+
+            return new Response(stream, {
+                headers: { 'Content-Type': 'application/wasm' }
+            });
+        }
+
+        (async () => {
+            try {
+                const wasmURL = 'main.wasm?v=' + new Date().getTime();
+                const progressResp = await streamingFetchWithProgress(wasmURL);
+                const go = new Go();
+                const result = await WebAssembly.instantiateStreaming(progressResp, go.importObject);
+
+                // Snap to 100% before fading out so the bar reads as "done"
+                // rather than freezing at whatever the last chunk reported.
+                fill.style.width = '100%';
+                text.textContent = '100%';
+
+                loader.classList.add('done');
+                setTimeout(() => loader.remove(), 500);
+
+                go.run(result.instance);
+            } catch (err) {
+                text.textContent = 'ERROR: ' + (err && err.message ? err.message : err);
+                console.error(err);
+            }
+        })();
     </script>
 </body>
 </html>
