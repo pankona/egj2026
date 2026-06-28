@@ -425,12 +425,25 @@ func pointerJustPressed() bool {
 	return inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft)
 }
 
+// pointerJustReleased is true on the frame the mouse button or touch ends.
+// Menu/state transitions key off release rather than press so the click that
+// dismisses a screen can't double as the start of a slash drag in the next
+// state — the player visibly finishes the gesture before the world changes.
+func pointerJustReleased() bool {
+	if len(inpututil.AppendJustReleasedTouchIDs(nil)) > 0 {
+		return true
+	}
+	return inpututil.IsMouseButtonJustReleased(ebiten.MouseButtonLeft)
+}
+
 func (g *Game) Update() error {
 	switch g.state {
 	case StateTitle:
-		if pointerJustPressed() || inpututil.IsKeyJustPressed(ebiten.KeySpace) {
+		if pointerJustReleased() || inpututil.IsKeyJustPressed(ebiten.KeySpace) {
 			g.loadStage(0)
 			g.state = StatePlaying
+			playSFX(sfxConfirm)
+			playBGM()
 		}
 	case StatePlaying:
 		g.updatePlaying()
@@ -450,10 +463,14 @@ func (g *Game) Update() error {
 		// advancing. Mirrors StateGameOver / StateAllCleared so the seal
 		// gets a held beat rather than auto-scrolling out from under the
 		// player.
-		if pointerJustPressed() || inpututil.IsKeyJustPressed(ebiten.KeySpace) {
+		if pointerJustReleased() || inpututil.IsKeyJustPressed(ebiten.KeySpace) {
 			g.loadStage(g.currentStage + 1)
 			if g.state != StateAllCleared {
 				g.state = StatePlaying
+				playSFX(sfxConfirm)
+				playBGM()
+			} else {
+				playSFX(sfxConfirm)
 			}
 		}
 	case StateGameOver:
@@ -461,17 +478,20 @@ func (g *Game) Update() error {
 			g.postClearCooldown--
 			break
 		}
-		if pointerJustPressed() || inpututil.IsKeyJustPressed(ebiten.KeySpace) {
+		if pointerJustReleased() || inpututil.IsKeyJustPressed(ebiten.KeySpace) {
 			g.loadStage(g.currentStage)
 			g.state = StatePlaying
+			playSFX(sfxConfirm)
+			playBGM()
 		}
 	case StateAllCleared:
 		if g.postClearCooldown > 0 {
 			g.postClearCooldown--
 			break
 		}
-		if pointerJustPressed() || inpututil.IsKeyJustPressed(ebiten.KeySpace) {
+		if pointerJustReleased() || inpututil.IsKeyJustPressed(ebiten.KeySpace) {
 			g.state = StateTitle
+			playSFX(sfxConfirm)
 		}
 	}
 	return nil
@@ -573,7 +593,15 @@ func (g *Game) updatePlaying() {
 				e.EdgeGlow = 1
 			}
 		}
+		// Rising-edge SE: only on the frame Feeding flips false→true so
+		// the bite is a discrete "chomp", not a continuous drone. The
+		// enemy keeps eating while Feeding stays true; the audio cue
+		// just marks the start of each engagement.
+		wasFeeding := e.Feeding
 		e.Feeding = g.erodeAround(e.X, e.Y, e.EffectRadius)
+		if !wasFeeding && e.Feeding {
+			playSFX(sfxErode)
+		}
 	}
 
 	// Claims are not permanent — once the perimeter is chewed through, the
@@ -592,6 +620,8 @@ func (g *Game) updatePlaying() {
 	if g.stageTime <= 0 {
 		g.state = StateGameOver
 		g.postClearCooldown = 45
+		stopBGM()
+		playSFX(sfxGameOver)
 		return
 	}
 
@@ -616,6 +646,8 @@ func (g *Game) updatePlaying() {
 		// the player watches the sealed pattern assemble itself instead
 		// of seeing it pop in.
 		g.beginKaleidoscope()
+		stopBGM()
+		playSFX(sfxClear)
 	}
 }
 
@@ -754,6 +786,15 @@ func (g *Game) fireSlash(x0, y0, x1, y1 int) {
 		UnfiredToY:   ufy1,
 	})
 
+	// Slash SE keys off unit count so 1-unit dabs sound lighter than 2/3-unit
+	// haymakers. Reuses the existing quantization rather than introducing a
+	// separate audio threshold.
+	if units >= 2 {
+		playSFX(sfxSlash)
+	} else {
+		playSFX(sfxSlashShort)
+	}
+
 	// Anchored enemies are vulnerable: a slash that grazes them removes the
 	// vertex (and any pair that included it stops contributing to the seal).
 	// Sever any remaining dark lines that the beam crossed. Both checks are
@@ -761,6 +802,7 @@ func (g *Game) fireSlash(x0, y0, x1, y1 int) {
 	// affects light, not enemies.
 	if g.isAnchoring() {
 		bladePx := float64(SlashHitRadius * CellSize)
+		before := len(g.enemies)
 		survivors := g.enemies[:0]
 		for _, e := range g.enemies {
 			if !e.IsBoss && pointSegmentDistance(e.X, e.Y, sx0, sy0, sx1, sy1) <= e.Radius+bladePx {
@@ -769,6 +811,9 @@ func (g *Game) fireSlash(x0, y0, x1, y1 int) {
 			survivors = append(survivors, e)
 		}
 		g.enemies = survivors
+		if len(g.enemies) < before {
+			playSFX(sfxEnemyDown)
+		}
 		for _, pair := range g.bindEdgesNow() {
 			if segmentsIntersect(pair[0].X, pair[0].Y, pair[1].X, pair[1].Y, sx0, sy0, sx1, sy1) {
 				g.severedPairs[pairKey(pair[0].ID, pair[1].ID)] = true
@@ -1156,6 +1201,11 @@ func (g *Game) claimEnclosure() {
 		survivors = append(survivors, e)
 	}
 	g.enemies = survivors
+	// Seal "thunk" plays on every successful claim, even territory-only
+	// grabs that don't trap anyone — it's the "the pocket closed" beat.
+	if claimed > 0 {
+		playSFX(sfxSeal)
+	}
 	if len(g.enemies) < before {
 		// Frame budget for the SEALED! flash. 30 frames at 60fps is half a
 		// second — long enough to register, short enough that the next
@@ -1166,6 +1216,10 @@ func (g *Game) claimEnclosure() {
 		if g.currentStage == 0 && g.tutorialStep < 2 {
 			g.tutorialStep = 2
 		}
+		// Single sfxEnemyDown even when multiple foes are sealed in one
+		// shot — stacked players pile amplitude into a wall of noise on
+		// lucky multi-claims.
+		playSFX(sfxEnemyDown)
 	}
 }
 
@@ -2312,6 +2366,7 @@ func clamp01(v float32) float32 {
 
 func main() {
 	initDebugMode()
+	initAudio()
 	ebiten.SetWindowSize(ScreenWidth, ScreenHeight)
 	ebiten.SetWindowTitle("Rift")
 	ebiten.SetWindowResizingMode(ebiten.WindowResizingModeEnabled)
