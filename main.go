@@ -2441,8 +2441,9 @@ func (g *Game) Draw(screen *ebiten.Image) {
 		g.drawCenterFace(screen, "UNLIT.", ScreenHeight/2-20, g.faceLarge, color.NRGBA{255, 150, 150, 255})
 		g.drawCenterFace(screen, "Click / Space", ScreenHeight/2+20, g.faceSmall, dim)
 	case StateAllCleared:
-		g.drawCenterFace(screen, "ALL LIT.", ScreenHeight/2-20, g.faceLarge, gold)
-		g.drawCenterFace(screen, "Click / Space", ScreenHeight/2+20, g.faceSmall, dim)
+		g.drawCenterFace(screen, "CONGRATS!", ScreenHeight/2-70, g.faceLarge, gold)
+		g.drawCenterFace(screen, "ALL LIT.", ScreenHeight/2-10, g.faceMid, gold)
+		g.drawCenterFace(screen, "Click / Space", ScreenHeight/2+50, g.faceSmall, dim)
 	}
 }
 
