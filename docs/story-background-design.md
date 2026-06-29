@@ -41,7 +41,7 @@
 | HTML タイトル | `Rift` | `Light Mandala` | `web/game.html`, `web/index.html` |
 | ローダー見出し | `RIFT` | `LIGHT MANDALA` | `web/game.html` `#loader-title` |
 | README ヘッダ | `# Rift` | `# Light Mandala` | `README.md` |
-| CLAUDE.md タイトル記述 | コードネーム `Rift` | タイトル `Light Mandala` (ビルド成果物名は `rift` 維持) | `CLAUDE.md` |
+| CLAUDE.md タイトル記述 | コードネーム `Rift` | タイトル `Light Mandala` (ビルド成果物名も `light-mandala` に統一) | `CLAUDE.md` |
 
 ### `LIT.` / `UNLIT.` / `LIT!` の対比
 

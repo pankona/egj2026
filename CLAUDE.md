@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 Ebitengine Game Jam 2026 への参加作品。テーマは **DISCONNECT（切断）**。
-タイトルは `Light Mandala`（ビルド成果物名は歴史的経緯で `rift` のまま — `dist/rift`, `rift-<sha>.zip`）。Go + Ebitengine + WebAssembly。
+タイトルは `Light Mandala`。Go + Ebitengine + WebAssembly。ビルド成果物名も `light-mandala` 系で揃える (`dist/light-mandala`, `light-mandala-<sha>.zip`)。
 
 ## ゲーム概要
 
@@ -56,12 +56,13 @@ Makefile                 build / build-wasm / serve-wasm / devserver / fmt / rel
 
 ```
 make run            ネイティブ実行 (go run .)
-make build          ネイティブバイナリを dist/rift に出力
+make build          ネイティブバイナリを dist/light-mandala に出力
 make build-wasm     wasm + wasm_exec.js + web/ を dist/ にまとめる
 make devserver      dist/ を localhost:18081 で配信
 make serve-wasm     build-wasm → devserver
 make watch          air で wasm を再ビルド + devserver を再起動 (初回のみ install-tools)
-make release        wasm をビルドして rift-<short-sha>.zip を作る
+make release        wasm をビルドして light-mandala-<short-sha>.zip を作る
+make release-itch   wasm をビルドして butler で itch.io へ push (pankona/light-mandala:html5)
 make lint           GOOS=js GOARCH=wasm go vet ./...
 make test           go test -v ./...
 make fmt            goimports -w .

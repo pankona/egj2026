@@ -1,4 +1,4 @@
-.PHONY: lint test build build-wasm serve-wasm devserver run clean fmt install-tools watch
+.PHONY: lint test build build-wasm serve-wasm devserver run clean fmt install-tools watch release release-itch
 
 lint:
 	GOOS=js GOARCH=wasm go vet ./...
@@ -7,7 +7,7 @@ test:
 	go test -v ./...
 
 build:
-	go build -o dist/rift .
+	go build -o dist/light-mandala .
 
 run:
 	go run .
@@ -39,4 +39,7 @@ clean:
 	rm -rf dist
 
 release: build-wasm
-	cd dist && zip -r ../rift-$$(git rev-parse --short HEAD).zip .
+	cd dist && zip -r ../light-mandala-$$(git rev-parse --short HEAD).zip .
+
+release-itch: build-wasm
+	butler push dist pankona/light-mandala:html5 --userversion $$(git rev-parse --short HEAD)
