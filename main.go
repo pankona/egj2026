@@ -267,7 +267,7 @@ type Game struct {
 	// (parallel lines, lines that only touch the border, etc.). Step 0:
 	// before any slash. Step 1: at least one slash fired, waiting on a
 	// successful claim. Step 2 onward: hint suppressed.
-	// sealedFlashFrames counts down a brief SEALED! center flash whenever
+	// sealedFlashFrames counts down a brief LIT! center flash whenever
 	// claimEnclosure removes one or more enemies, so the player feels the
 	// causal link between the closing slash and the kill.
 	tutorialStep      int
@@ -1207,7 +1207,7 @@ func (g *Game) claimEnclosure() {
 		playSFX(sfxSeal)
 	}
 	if len(g.enemies) < before {
-		// Frame budget for the SEALED! flash. 30 frames at 60fps is half a
+		// Frame budget for the LIT! flash. 30 frames at 60fps is half a
 		// second — long enough to register, short enough that the next
 		// strike doesn't have to wait for it to clear.
 		g.sealedFlashFrames = 30
@@ -2278,30 +2278,30 @@ func (g *Game) Draw(screen *ebiten.Image) {
 		g.drawCenterFace(screen, hint, ScreenHeight-60, g.faceLarge, white)
 	}
 
-	// SEALED! flash: triggered the frame claimEnclosure removed at least one
-	// enemy. Loud, brief, center-screen — sells the "your shape just killed
-	// something" causality that the silent enemy disappearance otherwise
+	// LIT! flash: triggered the frame claimEnclosure removed at least one
+	// enemy. Loud, brief, center-screen — sells the "your shape just lit
+	// the mandala" causality that the silent enemy disappearance otherwise
 	// hides under the slash glow. Gated on StatePlaying so it doesn't stack
-	// on top of the CLEAR message when the killing blow also empties the
+	// on top of the LIT. message when the killing blow also empties the
 	// board (same frame: sealedFlashFrames is set AND state flips to
 	// StateCleared, and Update stops ticking, so the flash would freeze
-	// underneath CLEAR forever).
+	// underneath LIT. forever).
 	if g.sealedFlashFrames > 0 && g.state == StatePlaying {
 		alphaT := float64(g.sealedFlashFrames) / 30.0
 		if alphaT > 1 {
 			alphaT = 1
 		}
 		c := color.NRGBA{255, 240, 180, uint8(255 * alphaT)}
-		g.drawCenterFace(screen, "SEALED!", ScreenHeight/2-20, g.faceLarge, c)
+		g.drawCenterFace(screen, "LIT!", ScreenHeight/2-20, g.faceLarge, c)
 	}
 
 	switch g.state {
 	case StateTitle:
-		g.drawCenterFace(screen, "RIFT", ScreenHeight/2-70, g.faceLarge, white)
+		g.drawCenterFace(screen, "LIGHT MANDALA", ScreenHeight/2-70, g.faceLarge, white)
 		g.drawCenterFace(screen, "DRAG.  SLASH.  ENCLOSE.  SEAL.", ScreenHeight/2-10, g.faceMid, white)
 		g.drawCenterFace(screen, "Click / Space", ScreenHeight/2+50, g.faceSmall, dim)
 	case StateCleared:
-		g.drawCenterFace(screen, "CLEAR", ScreenHeight/2-20, g.faceLarge, gold)
+		g.drawCenterFace(screen, "LIT.", ScreenHeight/2-20, g.faceLarge, gold)
 		// During the cooldown the mandala is still assembling; show what
 		// stage is next. Once the cooldown ends we're waiting on the
 		// player's click/space, so swap to the input prompt.
@@ -2310,17 +2310,17 @@ func (g *Game) Draw(screen *ebiten.Image) {
 			if g.currentStage+1 >= len(stages) {
 				hint = "Final stage"
 			} else {
-				hint = fmt.Sprintf("Next: Stage %d", g.currentStage+2)
+				hint = fmt.Sprintf("Next: %d / %d", g.currentStage+2, len(stages))
 			}
 		} else {
 			hint = "Click / Space"
 		}
 		g.drawCenterFace(screen, hint, ScreenHeight/2+20, g.faceSmall, dim)
 	case StateGameOver:
-		g.drawCenterFace(screen, "TIME UP", ScreenHeight/2-20, g.faceLarge, color.NRGBA{255, 150, 150, 255})
+		g.drawCenterFace(screen, "UNLIT.", ScreenHeight/2-20, g.faceLarge, color.NRGBA{255, 150, 150, 255})
 		g.drawCenterFace(screen, "Click / Space", ScreenHeight/2+20, g.faceSmall, dim)
 	case StateAllCleared:
-		g.drawCenterFace(screen, "ALL CLEAR", ScreenHeight/2-20, g.faceLarge, gold)
+		g.drawCenterFace(screen, "ALL LIT.", ScreenHeight/2-20, g.faceLarge, gold)
 		g.drawCenterFace(screen, "Click / Space", ScreenHeight/2+20, g.faceSmall, dim)
 	}
 }
@@ -2368,7 +2368,7 @@ func main() {
 	initDebugMode()
 	initAudio()
 	ebiten.SetWindowSize(ScreenWidth, ScreenHeight)
-	ebiten.SetWindowTitle("Rift")
+	ebiten.SetWindowTitle("Light Mandala")
 	ebiten.SetWindowResizingMode(ebiten.WindowResizingModeEnabled)
 	if err := ebiten.RunGame(newGame()); err != nil {
 		log.Fatal(err)

@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 Ebitengine Game Jam 2026 への参加作品。テーマは **DISCONNECT（切断）**。
-コードネームは `Rift`。Go + Ebitengine + WebAssembly。
+タイトルは `Light Mandala`（ビルド成果物名は歴史的経緯で `rift` のまま — `dist/rift`, `rift-<sha>.zip`）。Go + Ebitengine + WebAssembly。
 
 ## ゲーム概要
 
@@ -120,7 +120,7 @@ make fmt            goimports -w .
 ゲームジャム提出版でテストプレイヤーから「開始直後に何をしたらいいか分からない」という声が複数挙がっていた。原因を分解すると、(1) タイトル画面の英文 2 行は読み飛ばされやすい、(2) 開始時のステージ 1 は完全暗闇で `totalLight=0` の敵が描画スキップされ「画面に何もない」状態になる、(3) HUD と全状態遷移メッセージが `ebitenutil.DebugPrintAt` の固定幅 ASCII ビットマップで読みにくい、の 3 つだった。以下の判断で対応している。
 
 - **`text/v2` + 同梱フォント**: 文字描画を `github.com/hajimehoshi/ebiten/v2/text/v2` + `examples/resources/fonts.MPlus1pRegular_ttf` に差し替え。外部アセットを足さずに済む (`go mod tidy` で `golang.org/x/image` 系が間接依存に入るだけ)。3 サイズ (`faceLarge` 32 / `faceMid` 16 / `faceSmall` 12) を `Game` に保持し、`drawCenter` / `drawCenterFace` / `drawAt` の 3 ヘルパーで使い分け。**`text.DrawOptions.ColorScale.ScaleWithColor` は色を premultiplied alpha として扱う** ため `color.RGBA{R, G, B, A<255}` を渡すとグリフが滲んで隣文字と被って見える。フェードする SEALED! やデフォルト dim 色は必ず `color.NRGBA` で渡すこと
-- **タイトル画面は 3 行に圧縮**: 旧版の長文 2 行 (`Drag a straight slash. ...` / `Encircle the dark...`) を捨て、`RIFT` / `DRAG. SLASH. ENCLOSE. SEAL.` / `Click / Space` の 3 行に。4 拍の動詞リズムでゲームの動詞を宣言する形にして、読まなくても語感で意味が伝わるようにしている (国際的なジャムなので日本語化はせず、英単語を最小限に絞る方針)
+- **タイトル画面は 3 行に圧縮**: 旧版の長文 2 行 (`Drag a straight slash. ...` / `Encircle the dark...`) を捨て、`LIGHT MANDALA` / `DRAG. SLASH. ENCLOSE. SEAL.` / `Click / Space` の 3 行に。4 拍の動詞リズムでゲームの動詞を宣言する形にして、読まなくても語感で意味が伝わるようにしている (国際的なジャムなので日本語化はせず、英単語を最小限に絞る方針)。ステージクリア時の `LIT.` / タイムアップ時の `UNLIT.` / 全クリア時の `ALL LIT.` / 中盤フラッシュの `LIT!` も「曼荼羅が光で満ちる / 満ちなかった」の対比で統一
 - **ステージ 1 インラインチュートリアル**: 画面下中央に単語 1 個のヒントを表示。進行を **ドラッグ回数ではなく game event でガード**: ステップ 0 = `DRAG` / 開始時 → 最初の `fireSlash` 成功で 1 へ、ステップ 1 = `ENCLOSE` / claim 成立 (`claimEnclosure` が敵を 1 体以上消した) で 2 へ。なぜ stroke 数ベースにしないか: 3 本引いても閉領域が画面端に接していたり線が交差していなかったりで claim 不成立になる場合があり、「`1 MORE` の次で何も起きない」状態になると詰む。event ベースなら、囲めるまで `ENCLOSE` が残り続けて誘導が破綻しない
 - **ステージ 1 の敵を最初のスラッシュの真横にテレポート**: 上の「設計メモ: なぜ勝利条件を全滅に揃えたか」参照。`repositionTutorialFoeAwayFrom` がビームの perpendicular に 90px (片側で安全マージン 60px 内に収まる方を選ぶ、両方 OK なら画面中央に近い方) 移動させる。最初のスラッシュ後の light が広がる前 = 同一フレーム内で実行するので、テレポート自体は見えない
 - **HUD は数字に語らせる**: ラベル全削除、`STAGE 1 / 10` → `1 / 10` (左上 `faceMid`)、`FOES 3` → `3` (中央 `faceLarge`、勝利条件の数字を最大強調)、`30.0s` (右上 `faceMid`)、`35%` (左下 `faceSmall`、補助情報)。`Foes` 数字を最大にすることで「これを 0 にすれば勝ち」が一目で伝わる

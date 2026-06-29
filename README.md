@@ -1,4 +1,4 @@
-# Rift
+# Light Mandala
 
 [Ebitengine Game Jam 2026](https://itch.io/jam/ebitengine-game-jam-2026) 参加作品。テーマは **DISCONNECT**。
 
