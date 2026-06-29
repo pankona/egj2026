@@ -74,6 +74,26 @@ const (
 	EnemyHomingPx    = 260.0 // search radius for nearest light edge
 	EnemyRetargetSec = 0.75  // re-pick a target this often
 
+	// Boss split mechanic (stage 10). Instead of dying in one claim, the giant
+	// "disconnects" into smaller fragments. Enemy.SplitsLeft tracks how many
+	// splits remain: 2 = full boss, 1 = half-boss, 0 = zako (one-shot).
+	//   * full boss (SplitsLeft=2) sealed → 2 half-bosses + 2 zako spawn
+	//   * half-boss (SplitsLeft=1) sealed → 2 zako spawn (no more half-boss)
+	//   * zako (SplitsLeft=0) sealed       → dies normally
+	// Spawn positions are chosen via pickDarkSpawn so fragments materialize in
+	// still-dark, unclaimed territory (not the freshly lit pocket that just
+	// sealed). MinDist constants keep them outside an immediate follow-up
+	// strike so the player has to recompose before the next claim.
+	BossInitialSplits      = 2
+	BossFullRadius         = 70.0
+	BossFullEffectRadius   = 56.0
+	HalfBossRadius         = 38.0
+	HalfBossEffectRadius   = 30.0
+	BossZakoRadius         = 14.0
+	BossZakoSpeedMul       = 2.0   // zako move this much faster than the stage's EnemySpeed
+	HalfBossSpawnMinDistPx = 70.0  // half-bosses spawn at least this far from the sealed parent
+	BossZakoSpawnMinDistPx = 110.0 // zako spawn further out — they're a separate threat ring
+
 	// Bind: enemies form a dark enclosure as the mirror image of the player's
 	// claim. The phase loops Roaming -> Warning -> Holding; on Holding's last
 	// frame, completed edges + existing dark cells are flood-filled to seal
@@ -221,6 +241,12 @@ type Enemy struct {
 	// so a slash drawn as bait stalls a foe that drifts onto it, opening
 	// a window to encircle them with the next strikes.
 	Feeding bool
+
+	// SplitsLeft drives the stage-10 boss split mechanic (see the
+	// BossInitialSplits block in the constants section). Non-boss enemies
+	// leave it at 0 and die normally; boss/half-boss carry 2/1 and spawn
+	// fragments instead when sealed.
+	SplitsLeft int
 }
 
 type GameState int
@@ -363,9 +389,10 @@ func (g *Game) loadStage(idx int) {
 			VX:           s.EnemySpeed,
 			VY:           s.EnemySpeed * 0.6,
 			Speed:        s.EnemySpeed,
-			Radius:       70,
-			EffectRadius: 56,
+			Radius:       BossFullRadius,
+			EffectRadius: BossFullEffectRadius,
 			IsBoss:       true,
+			SplitsLeft:   BossInitialSplits,
 		})
 		return
 	}
@@ -1086,6 +1113,94 @@ func (g *Game) erodeAround(x, y, radius float64) bool {
 	return eroded
 }
 
+// pickDarkSpawn finds a magic-circle-interior cell whose Light is below the
+// wall threshold (i.e. still part of the dark, uncontested region — neither
+// freshly-painted slash nor sealed claim) and that sits at least minDistPx
+// from the (originX, originY) anchor. Used to drop boss-split fragments
+// somewhere the player has to re-engage, rather than into the just-sealed
+// pocket where they'd be immediately re-claimed or visually swallowed by the
+// glow. Returns ok=false when no candidate exists; callers fall back to the
+// parent position so the spawn never silently fails.
+func (g *Game) pickDarkSpawn(originX, originY, minDistPx float64) (float64, float64, bool) {
+	type cand struct{ x, y float64 }
+	var cands []cand
+	minD2 := minDistPx * minDistPx
+	for cx := 1; cx < GridWidth-1; cx++ {
+		for cy := 1; cy < GridHeight-1; cy++ {
+			if g.grid[cx][cy].Light >= WallLightThreshold {
+				continue
+			}
+			if cellOutsideMagicCircle(cx, cy) {
+				continue
+			}
+			px := float64(cx*CellSize + CellSize/2)
+			py := float64(cy*CellSize + CellSize/2)
+			dx := px - originX
+			dy := py - originY
+			if dx*dx+dy*dy < minD2 {
+				continue
+			}
+			cands = append(cands, cand{px, py})
+		}
+	}
+	if len(cands) == 0 {
+		return 0, 0, false
+	}
+	pick := cands[g.rng.Intn(len(cands))]
+	return pick.x, pick.y, true
+}
+
+// spawnBossSplits creates the fragment entities that replace a sealed boss or
+// half-boss. parent.SplitsLeft determines what comes back:
+//
+//	== 2 (full boss):  two half-bosses (SplitsLeft=1) + two zako (SplitsLeft=0)
+//	== 1 (half-boss):  two zako (SplitsLeft=0)
+//
+// baseSpeed is the stage's EnemySpeed; zako get BossZakoSpeedMul× of that so
+// they actually press the player after the slow giant disintegrates. Each
+// fragment's spawn position is drawn via pickDarkSpawn so it materializes in
+// still-contested territory; the parent's coordinates are the fallback when
+// the screen is too lit for any dark cell to qualify.
+func (g *Game) spawnBossSplits(parent *Enemy, baseSpeed float64) []*Enemy {
+	out := make([]*Enemy, 0, 4)
+	if parent.SplitsLeft >= 2 {
+		for i := 0; i < 2; i++ {
+			x, y, ok := g.pickDarkSpawn(parent.X, parent.Y, HalfBossSpawnMinDistPx)
+			if !ok {
+				x, y = parent.X, parent.Y
+			}
+			out = append(out, &Enemy{
+				X:            x,
+				Y:            y,
+				VX:           (g.rng.Float64()*2 - 1) * baseSpeed,
+				VY:           (g.rng.Float64()*2 - 1) * baseSpeed,
+				Speed:        baseSpeed,
+				Radius:       HalfBossRadius,
+				EffectRadius: HalfBossEffectRadius,
+				IsBoss:       true,
+				SplitsLeft:   1,
+			})
+		}
+	}
+	zakoSpeed := baseSpeed * BossZakoSpeedMul
+	for i := 0; i < 2; i++ {
+		x, y, ok := g.pickDarkSpawn(parent.X, parent.Y, BossZakoSpawnMinDistPx)
+		if !ok {
+			x, y = parent.X, parent.Y
+		}
+		out = append(out, &Enemy{
+			X:            x,
+			Y:            y,
+			VX:           (g.rng.Float64()*2 - 1) * zakoSpeed,
+			VY:           (g.rng.Float64()*2 - 1) * zakoSpeed,
+			Speed:        zakoSpeed,
+			Radius:       BossZakoRadius,
+			EffectRadius: EnemyErodeRadius,
+		})
+	}
+	return out
+}
+
 // claimEnclosure splits the playfield (everything inside the always-wall
 // 1-cell border ring) into 4-connected dark components and claims every
 // component that does NOT touch the playfield border. Components touching
@@ -1190,23 +1305,34 @@ func (g *Game) claimEnclosure() {
 		}
 		return false
 	}
-	before := len(g.enemies)
+	// Iterate enemies once: survivors stay in place, sealed enemies are
+	// either removed (zako/SplitsLeft=0) or replaced by fragments
+	// (boss/half-boss). kills tracks "something died this frame" so the
+	// SEALED! flash and sfxEnemyDown still fire even on splits where the
+	// total enemy count INCREASES (1 boss → 4 fragments).
+	stage := stages[g.currentStage]
+	var spawns []*Enemy
+	kills := 0
 	survivors := g.enemies[:0]
 	for _, e := range g.enemies {
 		cx := int(e.X) / CellSize
 		cy := int(e.Y) / CellSize
-		if sealed(cx, cy) {
+		if !sealed(cx, cy) {
+			survivors = append(survivors, e)
 			continue
 		}
-		survivors = append(survivors, e)
+		kills++
+		if e.SplitsLeft > 0 {
+			spawns = append(spawns, g.spawnBossSplits(e, stage.EnemySpeed)...)
+		}
 	}
-	g.enemies = survivors
+	g.enemies = append(survivors, spawns...)
 	// Seal "thunk" plays on every successful claim, even territory-only
 	// grabs that don't trap anyone — it's the "the pocket closed" beat.
 	if claimed > 0 {
 		playSFX(sfxSeal)
 	}
-	if len(g.enemies) < before {
+	if kills > 0 {
 		// Frame budget for the SEALED! flash. 30 frames at 60fps is half a
 		// second — long enough to register, short enough that the next
 		// strike doesn't have to wait for it to clear.
