@@ -103,7 +103,7 @@ make fmt            goimports -w .
 
 - **3 段サイクル**: `bindPhase` が Roaming (`0`) → Warning (`1`、脈動オーラの予告) → Holding (`2`、暗線が中点から両端へ伸びるアニメ) を周回。タイマーは全敵共通で、`BindRoamFrames` / `BindWarnFrames` / `BindHoldFrames` で各フェーズの長さを定義
 - **頂点と暗線**: Anchoring 中（phase 1/2）は敵が一斉に静止して頂点になる。`bindEdgesNow` が距離 `BindRangeCells` 以内のペアを動的に列挙、`severedPairs` に登録されていない組だけが暗線として描画・暗化に寄与する
-- **介入手段**: 静止中の敵に斬撃が当たれば撃破（`fireSlash` 内で `pointSegmentDistance` 判定、撃破した頂点を含むペアは自動で無効化）。完成中の暗線と斬撃の線分が `segmentsIntersect` で交差すれば、その組が `severedPairs` に登録されて bindEnclosure の壁ラスタライズから除外される
+- **介入手段**: 斬撃が anchored 敵の頂点を掠めるか、形成中の暗線と交差すれば、その**ペアが `severedPairs` に登録されて bindEnclosure の壁ラスタライズから除外される** (= 結界キャンセル)。**敵そのものは死なない**。当初は頂点を撃破する仕様だったが、囲って claim するより数倍簡単で「結界フェーズ = 無料の攻撃チャンス」と化していたため、介入は結界の阻止に絞り、敵の撃破は claim 経由 1 本に揃えた
 - **bindEnclosure**: claim の鏡写し。暗線をラスタライズした dark cells に既存の暗領域を足して壁集合とし、「明領域」を 4-連結成分に分解、`claimEnclosure` と同じく画面端に接しない閉領域だけを `Light=0` に落とす
 - **Boss と敵 1 体ステージはスキップ**: 結界は最小 2 頂点が要るので、`advanceBindPhase` は `s.Boss || len(g.enemies) < 2` で phase 進行を止める。`severedPairs` も同時にクリア
 
@@ -113,7 +113,7 @@ make fmt            goimports -w .
 
 判定を一本化して「敵全滅でクリア」に統一。`Stage.WinThreshold` フィールドも削除。ステージ 1 は敵 0 では成立しないので、`HarmlessEnemy: true` の **完全静止** (`EnemySpeed=0`)・`EffectRadius=0`（侵食しない）の 1 体に置き換え、「斬撃を引いて閉領域で claim する」基本ループを 30 秒で学ばせるチュートリアルに。`loadStage` 内でステージ 1 だけ敵を画面中央 (320, 240) 固定スポーンし、`fireSlash` での最初の発射時に `repositionTutorialFoeAwayFrom` が呼ばれてビーム中点から **垂直方向に 90px オフセットした位置にテレポート**する（最初のスラッシュ直後はまだ light が広がっていないので、移動はプレイヤーから視認されない）。これで「最初の 1 本が敵を貫いて見えなくなる」事故が構造的に消える。光カバー率は HUD の進捗メータ（`Light xx%`）として残してあるが、勝敗には関わらない。
 
-敵を倒す手段は (a) `claimEnclosure` で完全閉領域を作って中の敵を除去、(b) 結界の Anchoring 中に斬撃で頂点を撃破、の 2 ルート。Roaming 中の敵は斬撃で倒せないため、結界フェーズが「攻めのチャンス」になるリズムを意図的に作っている。
+敵を倒す手段は **`claimEnclosure` で完全閉領域を作って中の敵を除去する 1 ルートのみ**。結界の Anchoring 中に斬撃が敵を掠めても撃破はされず、結界形成だけがキャンセルされる (上の「設計メモ: なぜ敵に『結界』を持たせたか」参照)。Anchoring が「攻めのチャンス」なのは、敵が静止して囲いやすくなるためで、頂点を直接斬って点数を稼ぐためではない。
 
 ## 設計メモ: なぜラストボスを分裂式にしたか
 

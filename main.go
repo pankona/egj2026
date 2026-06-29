@@ -822,28 +822,23 @@ func (g *Game) fireSlash(x0, y0, x1, y1 int) {
 		playSFX(sfxSlashShort)
 	}
 
-	// Anchored enemies are vulnerable: a slash that grazes them removes the
-	// vertex (and any pair that included it stops contributing to the seal).
-	// Sever any remaining dark lines that the beam crossed. Both checks are
-	// gated on isAnchoring so during normal patrol the slash still only
-	// affects light, not enemies.
+	// A slash that grazes an anchored vertex, or crosses a forming dark line,
+	// severs the involved pair(s) — the bind for that round just doesn't seal.
+	// The enemy itself survives: killing was too cheap compared to claiming
+	// a closed region, so anchoring stopped being a real threat. Now the
+	// "attack chance" during anchoring is that stationary enemies are easier
+	// to encircle, not that they fall to a single passing beam. Both checks
+	// are gated on isAnchoring so normal patrol slashes still only affect
+	// light, not enemies.
 	if g.isAnchoring() {
 		bladePx := float64(SlashHitRadius * CellSize)
-		before := len(g.enemies)
-		survivors := g.enemies[:0]
-		for _, e := range g.enemies {
-			if !e.IsBoss && pointSegmentDistance(e.X, e.Y, sx0, sy0, sx1, sy1) <= e.Radius+bladePx {
-				continue // sealed/cut: this anchored enemy is removed
-			}
-			survivors = append(survivors, e)
-		}
-		g.enemies = survivors
-		if len(g.enemies) < before {
-			playSFX(sfxEnemyDown)
-		}
 		for _, pair := range g.bindEdgesNow() {
-			if segmentsIntersect(pair[0].X, pair[0].Y, pair[1].X, pair[1].Y, sx0, sy0, sx1, sy1) {
-				g.severedPairs[pairKey(pair[0].ID, pair[1].ID)] = true
+			a, b := pair[0], pair[1]
+			hitA := pointSegmentDistance(a.X, a.Y, sx0, sy0, sx1, sy1) <= a.Radius+bladePx
+			hitB := pointSegmentDistance(b.X, b.Y, sx0, sy0, sx1, sy1) <= b.Radius+bladePx
+			crossed := segmentsIntersect(a.X, a.Y, b.X, b.Y, sx0, sy0, sx1, sy1)
+			if hitA || hitB || crossed {
+				g.severedPairs[pairKey(a.ID, b.ID)] = true
 			}
 		}
 	}
