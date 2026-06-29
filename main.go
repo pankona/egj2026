@@ -2399,7 +2399,7 @@ func (g *Game) Draw(screen *ebiten.Image) {
 	if g.state == StatePlaying && g.currentStage == 0 && g.tutorialStep < 2 {
 		hint := "DRAG"
 		if g.tutorialStep == 1 {
-			hint = "ENCLOSE"
+			hint = "ENCLOSE THE ENEMY"
 		}
 		g.drawCenterFace(screen, hint, ScreenHeight-60, g.faceLarge, white)
 	}
